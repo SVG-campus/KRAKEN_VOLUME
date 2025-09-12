@@ -39,3 +39,10 @@ export function calcVolumeVelocity(prevPct, currentPct, intervalMs) {
   const pctChange = currentPct - prevPct;
   return pctChange / intervalHours;
 }
+
+import { clsx } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs) {
+  return twMerge(clsx(inputs));
+}

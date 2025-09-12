@@ -7,9 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",
-    "dev": "concurrently \"npm:start\" \"npm:dev --prefix frontend\"",
-    "postinstall": "npm install --prefix frontend",
-    "build": "npm run build --prefix frontend"
+    "dev": "concurrently \"npm:start\" \"npm:dev --prefix src\"",
+    "postinstall": "npm install --prefix src",
+    "build": "npm run build --prefix src"
   },
   "keywords": [],
   "author": "",
