@@ -1,5 +1,5 @@
 import { Refine } from "@refinedev/core";
-import { Dashboard } from "./pages/Dashboard";
+import { Dashboard } from "./Dashboard";
 
 function App() {
   return (
