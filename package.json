@@ -6,13 +6,19 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "dev": "concurrently \"npm:start\" \"npm:dev --prefix frontend\"",
+    "postinstall": "npm install --prefix frontend",
+    "build": "npm run build --prefix frontend"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "concurrently": "^8.2.2",
     "dotenv": "^17.2.2",
-    "undici": "^7.16.0"
+    "express": "^4.19.2",
+    "undici": "^7.16.0",
+    "ws": "^8.17.0"
   }
 }
