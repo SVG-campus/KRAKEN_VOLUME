@@ -1,3 +1,4 @@
+const path = require('path');
 const react = require("@vitejs/plugin-react");
 const { defineConfig } = require("vite");
 const tailwindcss = require("tailwindcss");
@@ -5,7 +6,7 @@ const tailwindConfig = require("./tailwind.config.js");
 const autoprefixer = require("autoprefixer");
 
 module.exports = defineConfig({
-  root: process.cwd(),
+  root: path.resolve(__dirname),
   plugins: [react()],
   css: {
     postcss: {
