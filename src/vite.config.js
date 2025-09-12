@@ -5,6 +5,7 @@ const tailwindConfig = require("./tailwind.config.js");
 const autoprefixer = require("autoprefixer");
 
 module.exports = defineConfig({
+  root: process.cwd(),
   plugins: [react()],
   css: {
     postcss: {
