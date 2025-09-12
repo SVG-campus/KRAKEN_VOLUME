@@ -19,6 +19,16 @@ Monitors multiple Kraken trading pairs for 24h volume vs price change divergence
 ## Persistent Hosting
 The script runs continuously, so deploy it on a persistent host (VM, container service, etc.). Vercel's serverless functions time out after ~10s and cron triggers at most once per minute, which is insufficient for sub-minute polling.
 
+### Running with PM2
+On a VM you can keep the monitor alive with [PM2](https://pm2.keymetrics.io/):
+
+```
+pm2 start src/index.js --name kraken-volume
+pm2 save && pm2 startup systemd
+```
+
+The app loads `.env` automatically via `dotenv`, so no extra `node_args` are required.
+
 ## Testing
 ```
 npm test

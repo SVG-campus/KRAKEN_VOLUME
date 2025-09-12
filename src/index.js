@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config();
 import { ProxyAgent } from 'undici';
 import { calcVolumePctChange, calcPriceChangePct, calcVolumeVelocity } from './utils.js';
 
