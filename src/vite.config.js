@@ -1,10 +1,10 @@
-import react from "@vitejs/plugin-react"
-import { defineConfig } from "vite"
-import tailwindcss from "tailwindcss";
-import tailwindConfig from "./tailwind.config.js";
-import autoprefixer from "autoprefixer";
+const react = require("@vitejs/plugin-react");
+const { defineConfig } = require("vite");
+const tailwindcss = require("tailwindcss");
+const tailwindConfig = require("./tailwind.config.js");
+const autoprefixer = require("autoprefixer");
 
-export default defineConfig({
+module.exports = defineConfig({
   plugins: [react()],
   css: {
     postcss: {
@@ -14,4 +14,4 @@ export default defineConfig({
   server: {
     port: 3001, // Run dev server on a different port than the backend
   },
-})
+});
