@@ -1,124 +1,221 @@
-import dotenv from 'dotenv';
-dotenv.config();
+// src/index.js  (CommonJS for easy PM2 usage)
+require('dotenv').config();
+const path = require('path');
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const WebSocket = require('ws');
+const axios = require('axios');
 
-import path from 'path';
-import { fileURLToPath } from 'url';
-import express from 'express';
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import { ProxyAgent } from 'undici';
-import { calcVolumePctChange, calcPriceChangePct, calcVolumeVelocity } from './utils.js';
+const PORT = Number(process.env.PORT || 3000);
+const RATE_WINDOW_SEC = Number(process.env.RATE_WINDOW_SEC || 60);
+const ALERT_THRESHOLD = Number(process.env.ALERT_THRESHOLD_PCT || 10);
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
+const PAPER = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const WS_PAIRS =
+  (process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-const proxy = process.env.https_proxy || process.env.HTTPS_PROXY;
-const dispatcher = proxy ? new ProxyAgent(proxy) : undefined;
-
-const pairs = (process.env.KRAKEN_PAIRS || 'XXBTZUSD,SOLUSD').split(',').map(p => p.trim()).filter(Boolean);
-const slackWebhook = process.env.SLACK_WEBHOOK_URL;
-const interval = Number(process.env.POLL_INTERVAL_MS) || 30000; // default 30s
-const PORT = process.env.PORT || 3000;
-
-const state = {}; // pair -> { volume, pct }
-let latestResults = []; // a cache of the latest results for new clients
-
-async function fetchTickers() {
-  const res = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${pairs.join(',')}`, { dispatcher });
-  const data = await res.json();
-  if (data.error && data.error.length) {
-    throw new Error(data.error.join(', '));
-  }
-  return data.result;
-}
-
-async function sendSlack(message) {
-  if (!slackWebhook) return;
-  await fetch(slackWebhook, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text: message }),
-    dispatcher
-  });
-}
-
+// ---------- Express + Socket.IO ----------
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-wss.on('connection', (ws) => {
-  console.log('Client connected');
-  // Send the latest results immediately on connection
-  if (latestResults.length > 0) {
-    ws.send(JSON.stringify({ type: 'update', data: latestResults }));
-  }
-  ws.on('close', () => {
-    console.log('Client disconnected');
-  });
+const io = new Server(server, {
+  cors: { origin: '*' }
 });
 
-function broadcast(data) {
-  wss.clients.forEach(client => {
-    if (client.readyState === client.OPEN) {
-      client.send(JSON.stringify(data));
-    }
-  });
-}
-
-async function check() {
-  try {
-    const tickers = await fetchTickers();
-    const results = [];
-
-    for (const [pair, ticker] of Object.entries(tickers)) {
-      const volume24h = parseFloat(ticker.v[1]);
-      const lastPrice = parseFloat(ticker.c[0]);
-      const openPrice = parseFloat(ticker.o);
-      const priceChangePct = calcPriceChangePct(openPrice, lastPrice);
-      const prev = state[pair];
-      const volumePctChange = calcVolumePctChange(prev?.volume ?? null, volume24h);
-      const volumeVelocity = prev && volumePctChange !== null
-        ? calcVolumeVelocity(prev.pct, volumePctChange, interval)
-        : null;
-      state[pair] = { volume: volume24h, pct: volumePctChange };
-      const diff = volumePctChange === null ? null : volumePctChange - priceChangePct;
-      results.push({ pair, volumePctChange, priceChangePct, diff, volumeVelocity });
-      if (diff !== null && Math.abs(diff) >= 10) {
-        await sendSlack(`Kraken ${pair}: volume ${volumePctChange.toFixed(2)}% price ${priceChangePct.toFixed(2)}% diff ${diff.toFixed(2)}% velocity ${volumeVelocity !== null ? volumeVelocity.toFixed(2) : 'n/a'}%/h`);
-      }
-    }
-
-    latestResults = results; // cache the results
-
-    // Broadcast the new results to all connected WebSocket clients
-    broadcast({ type: 'update', data: results });
-
-    const ranked = results.filter(r => r.volumeVelocity !== null).sort((a, b) => b.volumeVelocity - a.volumeVelocity);
-    if (ranked.length === 0) {
-      console.log('Waiting for baseline volume data...');
-    } else {
-      const top = ranked[0];
-      const second = ranked[1];
-      const msg = `${new Date().toISOString()} | Top: ${top.pair} (${top.volumeVelocity.toFixed(2)}%/h)` + (second ? ` | Second: ${second.pair} (${second.volumeVelocity.toFixed(2)}%/h)` : '');
-      console.log(msg);
-    }
-  } catch (err) {
-    console.error('Error fetching ticker', err);
-  }
-}
-
-// Serve the built frontend
-const frontendDistPath = path.join(__dirname, '..', 'frontend', 'dist');
+// Serve the Vite build
+const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
-
-// API endpoint to get initial data
-app.get('/api/data', (req, res) => {
-  res.json(latestResults);
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
+io.on('connection', (socket) => {
+  socket.emit('hello', { ok: true, ts: Date.now() });
+});
+
+// ---------- Slack ----------
+async function slack(text, blocks) {
+  if (!SLACK_WEBHOOK_URL) return;
+  try {
+    await axios.post(SLACK_WEBHOOK_URL, blocks ? { text, blocks } : { text });
+  } catch (e) {
+    console.error('Slack error', e.message);
+  }
+}
+
+// ---------- State & helpers ----------
+/**
+ * perPair[pair] = {
+ *   last: { ts, vol24, price, avg24 },
+ *   buf: [{ts, vol24}, ...],  // recent samples
+ *   volVelPct, priceChangePct, diffPct
+ * }
+ */
+const perPair = Object.create(null);
+for (const p of WS_PAIRS) {
+  perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0 };
+}
+
+function pct(n) { return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
+
+function computeVelocity(pair, ts, vol24, price, avg24) {
+  const S = perPair[pair];
+  // Keep a small rolling buffer (5–10 minutes is plenty for the UI)
+  const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
+  S.buf.push({ ts, vol24 });
+  while (S.buf.length && ts - S.buf[0].ts > HORIZON_SEC) S.buf.shift();
+
+  // Find the comparison sample ~RATE_WINDOW_SEC ago
+  let older = S.buf[0];
+  for (let i = S.buf.length - 1; i >= 0; i--) {
+    if (ts - S.buf[i].ts >= RATE_WINDOW_SEC) { older = S.buf[i]; break; }
+  }
+  const dt = Math.max(1, ts - older.ts); // seconds
+  const v0 = Math.max(older.vol24 || 0, 1e-9);
+  const dv = vol24 - (older.vol24 || 0);
+
+  // volume “velocity” as %/h over the chosen window
+  const volVelPct = ((dv / v0) * (3600 / dt)) * 100;
+
+  // price change vs 24h average price (WS 'p[1]'), as a % (proxy for “24h price change”)
+  const priceChangePct = ((price - avg24) / Math.max(avg24, 1e-9)) * 100;
+
+  S.last = { ts, vol24, price, avg24 };
+  S.volVelPct = volVelPct;
+  S.priceChangePct = priceChangePct;
+  S.diffPct = volVelPct - priceChangePct;
+}
+
+let lastAlert = 0;
+function maybeAlert(pair) {
+  const S = perPair[pair];
+  if (!S || !S.last) return;
+
+  const now = Date.now();
+  // Cooldown 2 min between alerts to avoid spam
+  if (now - lastAlert < 120000) return;
+
+  if (S.volVelPct >= ALERT_THRESHOLD) {
+    lastAlert = now;
+    const msg = `⚡ ${pair}: Volume velocity ${pct(S.volVelPct)}%/h (Δ vs price ${pct(S.diffPct)}%).`;
+    slack(msg, [
+      { type: 'section', text: { type: 'mrkdwn', text: `*Buy signal?* *${pair}*` } },
+      { type: 'section', fields: [
+        { type: 'mrkdwn', text: `*Vol velocity:*\n${pct(S.volVelPct)}%/h` },
+        { type: 'mrkdwn', text: `*Price Δ vs 24h avg:*\n${pct(S.priceChangePct)}%` },
+        { type: 'mrkdwn', text: `*Diff (vol - price):*\n${pct(S.diffPct)}%` },
+      ] }
+    ]);
+  }
+
+  if (S.volVelPct <= -ALERT_THRESHOLD) {
+    lastAlert = now;
+    const msg = `🧯 ${pair}: Negative volume velocity ${pct(S.volVelPct)}%/h (Δ vs price ${pct(S.diffPct)}%).`;
+    slack(msg);
+  }
+}
+
+// Snapshot for UI
+function currentSnapshot() {
+  const pairs = {};
+  for (const p of WS_PAIRS) {
+    const S = perPair[p];
+    if (!S.last) continue;
+    pairs[p] = {
+      ts: S.last.ts,
+      price: S.last.price,
+      avg24: S.last.avg24,
+      vol24: S.last.vol24,
+      volVelPct: pct(S.volVelPct),
+      priceChangePct: pct(S.priceChangePct),
+      diffPct: pct(S.diffPct)
+    };
+  }
+  // rank by vol velocity
+  const ranked = Object.entries(pairs)
+    .sort((a,b) => b[1].volVelPct - a[1].volVelPct)
+    .map(([k]) => k);
+  return { ts: Math.floor(Date.now()/1000), pairs, top: ranked.slice(0, 2) };
+}
+
+// Broadcast snapshots to UI every 2s
+setInterval(() => {
+  io.emit('snapshot', currentSnapshot());
+}, 2000);
+
+// ---------- Kraken WS “ticker” ----------
+function krakenSubscribe(ws, pairs) {
+  ws.send(JSON.stringify({
+    event: 'subscribe',
+    pair: pairs,
+    subscription: { name: 'ticker' }
+  }));
+}
+
+function parseTickerMessage(msg) {
+  // Ticker comes as an array: [channelId, data, pair, "ticker"]  (sometimes pair and channelName swap)
+  if (!Array.isArray(msg) || msg.length < 2 || typeof msg[1] !== 'object') return null;
+
+  const data = msg[1];
+  const maybe2 = typeof msg[2] === 'string' ? msg[2] : '';
+  const maybe3 = typeof msg[3] === 'string' ? msg[3] : '';
+
+  const pair = (maybe2.includes('/') ? maybe2 : (maybe3.includes('/') ? maybe3 : null));
+  if (!pair) return null;
+
+  // data fields per Kraken docs
+  const lastPrice = parseFloat(data.c?.[0] || '0');     // last trade price
+  const vol24 = parseFloat(data.v?.[1] || '0');         // 24h volume
+  const avg24 = parseFloat(data.p?.[1] || '0');         // 24h average price
+
+  return { pair, lastPrice, vol24, avg24 };
+}
+
+function startKraken() {
+  const ws = new WebSocket('wss://ws.kraken.com/');
+  ws.on('open', () => {
+    console.log('Kraken WS open. Subscribing:', WS_PAIRS.join(', '));
+    krakenSubscribe(ws, WS_PAIRS);
+  });
+  ws.on('message', (buf) => {
+    try {
+      const obj = JSON.parse(buf.toString());
+      if (obj.event) {
+        if (obj.event === 'heartbeat') return;
+        if (obj.event === 'subscriptionStatus') {
+          if (obj.status !== 'subscribed') console.warn('Sub status', obj);
+          return;
+        }
+        return;
+      }
+      const tick = parseTickerMessage(obj);
+      if (!tick) return;
+
+      const ts = Math.floor(Date.now() / 1000);
+      computeVelocity(tick.pair, ts, tick.vol24, tick.lastPrice, tick.avg24);
+      maybeAlert(tick.pair);
+    } catch (e) {
+      console.error('WS parse err', e.message);
+    }
+  });
+  ws.on('close', () => {
+    console.warn('Kraken WS closed. Reconnecting in 3s…');
+    setTimeout(startKraken, 3000);
+  });
+  ws.on('error', (e) => {
+    console.error('Kraken WS error', e.message);
+    try { ws.close(); } catch {}
+  });
+}
+
+startKraken();
+
+// ---------- Start server ----------
 server.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-  // Start polling
-  check();
-  setInterval(check, interval);
+  console.log(`Server listening on :${PORT}`);
+  console.log(`Open http://<your-ip>:${PORT}/`);
 });
