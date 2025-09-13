@@ -127,19 +127,21 @@ async function slack(text, blocks) {
 // Pre-seed perPair only for explicit env list; auto-discovery will add later.
 if (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() !== 'ALL') {
   for (const p of KRAKEN_WS_PAIRS_RAW.split(',').map(s => s.trim()).filter(Boolean)) {
-    perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
+    perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { stepIndex: 0, lastTime: 0, lastDiff: 0, sign: 0 } };
   }
 }
 
 function computeVelocity(pair, ts, vol24, price, avg24) {
-  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
+  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { stepIndex: 0, lastTime: 0, lastDiff: 0, sign: 0 } };
   const S = perPair[pair];
 
   const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
-  S.buf.push({ ts, vol24, diff: S.diffPct || 0 });
+
+  // Trim old samples (we will push the NEW sample AFTER computing)
   while (S.buf.length && ts - S.buf[0].ts > HORIZON_SEC) S.buf.shift();
 
-  let older = S.buf[0];
+  // Find an older sample ~RATE_WINDOW_SEC ago (or fallback)
+  let older = S.buf.length ? S.buf[0] : { ts: ts - 1, vol24, diff: S.diffPct || 0 };
   for (let i = S.buf.length - 1; i >= 0; i--) {
     if (ts - S.buf[i].ts >= RATE_WINDOW_SEC) { older = S.buf[i]; break; }
   }
@@ -148,22 +150,34 @@ function computeVelocity(pair, ts, vol24, price, avg24) {
   const v0 = Math.max(older.vol24 || 0, 1e-9);
   const dv = vol24 - (older.vol24 || 0);
 
-  // %/h on 24h volume
-  const volVelPct = ((dv / v0) * (3600 / dt)) * 100;
-  // price vs 24h avg
-  const priceChangePct = ((price - avg24) / Math.max(avg24, 1e-9)) * 100;
+  const volVelPct = ((dv / v0) * (3600 / dt)) * 100;                        // %/h
+  const priceChangePct = ((price - avg24) / Math.max(avg24, 1e-9)) * 100;   // %
 
   S.last = { ts, vol24, price, avg24 };
   S.volVelPct = volVelPct;
   S.priceChangePct = priceChangePct;
   S.diffPct = volVelPct - priceChangePct;
 
-  maybeAlert(pair);
+  // Push the NEW sample (ts, vol24, diff) so slope uses current values
+  S.buf.push({ ts, vol24, diff: S.diffPct });
+
+  maybeAlert(pair, ts);
 }
 
-// ================== ALERTING (1.25% steps both directions) ==================
+// ================== ALERTING (stepwise UP/DOWN + reminders) ==================
+function nowMs() { return Date.now(); }
+
+// Step index based on ABS(diff), symmetric for +/-
+// 0  => below threshold
+// 1  => [T, T+step)
+// 2  => [T+step, T+2*step), etc.
+function stepIndexForDiff(diff) {
+  const mag = Math.abs(diff);
+  if (mag < ALERT_DIFF_THRESHOLD_PCT) return 0;
+  return 1 + Math.floor((mag - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT);
+}
+
 function recentSlope(S) {
-  // Rough d(diff)/dt over the last ~2 samples
   const n = S.buf.length;
   if (n < 2) return 0;
   const a = S.buf[Math.max(0, n - 3)];
@@ -173,64 +187,71 @@ function recentSlope(S) {
   return d / dt; // % per second
 }
 
-// Quantize diff to signed levels: …, -6.25, -5.00, 0, 5.00, 6.25, …
-function quantizeLevel(diffPct) {
-  const ad = Math.abs(diffPct);
-  if (ad < ALERT_DIFF_THRESHOLD_PCT) return 0;
-  const stepsAbove = Math.floor((ad - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1; // 5.00→1, 6.25→2…
-  const level = ALERT_DIFF_THRESHOLD_PCT + (stepsAbove - 1) * ALERT_LEVEL_STEP_PCT;
-  // keep sign of diff
-  const signed = level * Math.sign(diffPct);
-  return Math.round(signed * 100) / 100; // avoid FP jitter
+function emojiFor(sign, lvl) {
+  const up = '🚀', down = '🧯';
+  const base = sign >= 0 ? up : down;
+  if (lvl >= 5) return base + base + '🔥';
+  if (lvl === 4) return base + base;
+  if (lvl === 3) return base + '🔥';
+  if (lvl === 2) return base;
+  return '⚡';
 }
 
-function maybeAlert(pair) {
+function maybeAlert(pair, _tsSec) {
   const S = perPair[pair];
   if (!S || !S.last) return;
 
-  const diffNow = pct(S.diffPct);
-  const newLevel = quantizeLevel(diffNow);
-  const a = (S.alert ||= { level: 0, lastAt: 0 });
-  const prevLevel = a.level;
-  const now = Date.now();
+  const diff = pct(S.diffPct);               // signed
+  const sign = diff >= 0 ? 1 : -1;           // direction of advantage (vol vs price)
+  const step = stepIndexForDiff(diff);       // magnitude bucket
+  const a = (S.alert ||= { lastTime: 0, stepIndex: 0, lastDiff: 0, sign: 0 });
+  const now = nowMs();
 
-  // No change in quantized level → no alert
-  if (newLevel === prevLevel) return;
+  const prevStep = a.stepIndex || 0;
+  const deltaSteps = step - prevStep;        // can be negative
+  const crossedOut = (step === 0 && prevStep > 0);
+  const enoughTime = (now - a.lastTime) >= ALERT_MIN_MS;
 
-  // Cooldown
-  if (now - a.lastAt < ALERT_MIN_MS) return;
-
-  // Dropped below threshold → disarm once
-  if (newLevel === 0 && prevLevel !== 0) {
-    const emoji = prevLevel > 0 ? '🟢🔕' : '🔴🔕';
-    slack(
-      `${emoji} ${pair}: diff back *below ${ALERT_DIFF_THRESHOLD_PCT.toFixed(2)}%* (now ${pct(diffNow)}%). ` +
-      `VolVel ${pct(S.volVelPct)}%/h • Price ${pct(S.priceChangePct)}%`
-    );
-    a.level = 0;
-    a.lastAt = now;
-    return;
+  // Decide when to alert:
+  //  - crossed UP one or more step(s)
+  //  - crossed DOWN one or more step(s)
+  //  - dropped back below threshold
+  //  - periodic reminder while still above threshold
+  let reason = '';
+  if (deltaSteps > 0) {
+    const moved = (deltaSteps * ALERT_LEVEL_STEP_PCT);
+    reason = `UP ${moved % 1 ? moved.toFixed(2) : moved.toFixed(0)}%`;
+  } else if (deltaSteps < 0 && step > 0) {
+    const moved = ((-deltaSteps) * ALERT_LEVEL_STEP_PCT);
+    reason = `DOWN ${moved % 1 ? moved.toFixed(2) : moved.toFixed(0)}%`;
+  } else if (crossedOut) {
+    reason = `BACK BELOW ${ALERT_DIFF_THRESHOLD_PCT}%`;
+  } else if (step > 0 && enoughTime) {
+    reason = `REMINDER`;
+  } else {
+    return; // no alert
   }
 
-  // Stepped up or down within the band (≥ base)
-  const delta = Math.round((newLevel - prevLevel) * 100) / 100; // signed step change
-  const dir = delta > 0 ? 'UP' : 'DOWN';
-  const arrow = delta > 0 ? '⬆️' : '⬇️';
+  const slope = recentSlope(S);               // % per second
+  const perMin = pct(slope * 60);
+  const emj = emojiFor(sign, step);
 
-  // Intensity by distance above base (cap at 5)
-  const rank = Math.min(5, Math.floor((Math.abs(newLevel) - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1);
-  const flames = newLevel > 0 ? '🔥'.repeat(rank) : '🧊'.repeat(rank);
+  const msg = `${emj} *${pair}*  ${reason} — diff=${pct(diff)}%  (volVel=${pct(S.volVelPct)}%/h, priceΔ=${pct(S.priceChangePct)}%) • ${sign >= 0 ? '↑' : '↓'} ~${perMin}%/min`;
 
-  const slope = recentSlope(S);         // % per second
-  const perMin = pct(slope * 60);       // % per minute (approx trend)
+  const blocks = [
+    { type: 'section', text: { type: 'mrkdwn', text: msg } },
+    { type: 'context', elements: [
+      { type: 'mrkdwn', text: `Level ${step} (threshold ${ALERT_DIFF_THRESHOLD_PCT}%, step ${ALERT_LEVEL_STEP_PCT}%)` },
+      { type: 'mrkdwn', text: `price=${S.last.price.toFixed(6)} avg24=${S.last.avg24.toFixed(6)} vol24=${Math.round(S.last.vol24)}` }
+    ]}
+  ];
+  slack(msg.replace(/\*/g, ''), blocks);
 
-  slack(
-    `${flames} ${pair}: ${arrow} ${dir} ${Math.abs(delta).toFixed(2)}% to **${Math.abs(newLevel).toFixed(2)}% diff**\n` +
-    `• VolVel ${pct(S.volVelPct)}%/h • Price ${pct(S.priceChangePct)}% • Diff ${pct(diffNow)}% • ~${perMin}%/min`
-  );
-
-  a.level = newLevel;
-  a.lastAt = now;
+  // Update state
+  a.lastTime = now;
+  a.stepIndex = step;
+  a.lastDiff = diff;
+  a.sign = sign;
 }
 
 // Broadcast snapshots to UI every 2s
@@ -343,7 +364,7 @@ async function discoverAllPairs() {
 
   // Ensure state exists for each subscribed pair
   for (const p of WS_PAIRS) {
-    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
+    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { stepIndex: 0, lastTime: 0, lastDiff: 0, sign: 0 } };
   }
 
   // Start WebSocket
