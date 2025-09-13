@@ -8,16 +8,25 @@ const { Server } = require('socket.io');
 const WebSocket = require('ws');
 const axios = require('axios');
 
-// ================== ENV / CONFIG ==================
+/* ================== ENV / CONFIG ================== */
 const PORT                  = Number(process.env.PORT || 3000);
 const RANK_MODE             = (process.env.RANK_MODE || 'ratio');   // 'ratio' | 'volvel'
 const RATE_WINDOW_SEC       = Number(process.env.RATE_WINDOW_SEC || 60);
 
-// Alerting
+// Alerting (legacy stepwise escalation — optional)
+const ALERT_MODE            = (process.env.ALERT_MODE || 'digest'); // 'digest' | 'escalate' | 'both'
 const ALERT_DIFF_THRESHOLD_PCT = Number(process.env.ALERT_DIFF_THRESHOLD_PCT || 5);     // base, e.g. 5%
 const ALERT_LEVEL_STEP_PCT     = Number(process.env.ALERT_LEVEL_STEP_PCT || 1.25);      // steps, e.g. 1.25%
 const ALERT_MIN_INTERVAL_SEC   = Number(process.env.ALERT_MIN_INTERVAL_SEC || 300);     // per-coin cool-down
 const ALERT_MIN_MS             = ALERT_MIN_INTERVAL_SEC * 1000;
+
+// Digest (anti-spam, sustained winners)
+const DIGEST_WINDOW_SEC     = Number(process.env.DIGEST_WINDOW_SEC || 300);  // average window (default 5m)
+const DIGEST_INTERVAL_SEC   = Number(process.env.DIGEST_INTERVAL_SEC || 120); // summary cadence
+const DIGEST_TOP_N          = Number(process.env.DIGEST_TOP_N || 5);
+const DIGEST_MIN_ABS_DIFF   = Number(process.env.DIGEST_MIN_ABS_DIFF || 3);   // ignore if |avgΔ| below this
+const DIGEST_CHANGE_STEP_PCT= Number(process.env.DIGEST_CHANGE_STEP_PCT || ALERT_LEVEL_STEP_PCT); // re-post threshold
+const DIGEST_INCLUDE_NEGATIVE = `${process.env.DIGEST_INCLUDE_NEGATIVE || 'false'}`.toLowerCase() === 'true';
 
 const SLACK_WEBHOOK_URL     = process.env.SLACK_WEBHOOK_URL || '';
 const PAPER                 = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false'; // unused but kept
@@ -33,7 +42,7 @@ const SUB_BATCH_DELAY_MS    = Number(process.env.SUB_BATCH_DELAY_MS || 600);
 const EXCLUDE_REGEX_STR     = process.env.KRAKEN_EXCLUDE_REGEX || ''; // e.g. '(USDT|EUR)'
 const EXCLUDE_REGEX         = EXCLUDE_REGEX_STR ? new RegExp(EXCLUDE_REGEX_STR) : null;
 
-// ================== EXPRESS + SOCKET.IO ==================
+/* ================== EXPRESS + SOCKET.IO ================== */
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
@@ -96,13 +105,16 @@ function currentSnapshot() {
 
   return {
     ts: Math.floor(Date.now() / 1000),
-    meta: { rankMode: RANK_MODE, quote: KRAKEN_QUOTE, subscribed: WS_PAIRS.length },
+    meta: { rankMode: RANK_MODE, quote: KRAKEN_QUOTE, subscribed: WS_PAIRS.length, alertMode: ALERT_MODE },
     pairs,
     top: ranked.slice(0, 5),
   };
 }
 
 app.get('/api/snapshot', (_req, res) => res.json(currentSnapshot()));
+
+// Optional: expose current digest calc
+app.get('/api/digest', (_req, res) => res.json(buildDigestReport()));
 
 // Final SPA fallback (keep AFTER routes & static)
 app.use((_req, res) => {
@@ -113,7 +125,7 @@ io.on('connection', (socket) => {
   socket.emit('hello', { ok: true, ts: Date.now() });
 });
 
-// ================== SLACK ==================
+/* ================== SLACK ================== */
 async function slack(text, blocks) {
   if (!SLACK_WEBHOOK_URL) return;
   try {
@@ -123,16 +135,16 @@ async function slack(text, blocks) {
   }
 }
 
-// ================== STATE & COMPUTATION ==================
+/* ================== STATE & COMPUTATION ================== */
 // Pre-seed perPair only for explicit env list; auto-discovery will add later.
 if (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() !== 'ALL') {
   for (const p of KRAKEN_WS_PAIRS_RAW.split(',').map(s => s.trim()).filter(Boolean)) {
-    perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { stepIndex: 0, lastTime: 0, lastDiff: 0, sign: 0 } };
+    perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
   }
 }
 
 function computeVelocity(pair, ts, vol24, price, avg24) {
-  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { stepIndex: 0, lastTime: 0, lastDiff: 0, sign: 0 } };
+  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
   const S = perPair[pair];
 
   const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
@@ -141,7 +153,7 @@ function computeVelocity(pair, ts, vol24, price, avg24) {
   while (S.buf.length && ts - S.buf[0].ts > HORIZON_SEC) S.buf.shift();
 
   // Find an older sample ~RATE_WINDOW_SEC ago (or fallback)
-  let older = S.buf.length ? S.buf[0] : { ts: ts - 1, vol24, diff: S.diffPct || 0 };
+  let older = S.buf.length ? S.buf[0] : { ts: ts - 1, vol24, diff: S.diffPct || 0, volVel: S.volVelPct || 0, price: S.priceChangePct || 0 };
   for (let i = S.buf.length - 1; i >= 0; i--) {
     if (ts - S.buf[i].ts >= RATE_WINDOW_SEC) { older = S.buf[i]; break; }
   }
@@ -158,26 +170,17 @@ function computeVelocity(pair, ts, vol24, price, avg24) {
   S.priceChangePct = priceChangePct;
   S.diffPct = volVelPct - priceChangePct;
 
-  // Push the NEW sample (ts, vol24, diff) so slope uses current values
-  S.buf.push({ ts, vol24, diff: S.diffPct });
+  // Push the NEW sample so digest/slope have history
+  S.buf.push({ ts, vol24, diff: S.diffPct, volVel: S.volVelPct, price: S.priceChangePct });
 
-  maybeAlert(pair, ts);
+  if (ALERT_MODE !== 'digest') {
+    maybeEscalationAlert(pair); // optional legacy stepwise mode
+  }
 }
 
-// ================== ALERTING (stepwise UP/DOWN + reminders) ==================
-function nowMs() { return Date.now(); }
-
-// Step index based on ABS(diff), symmetric for +/-
-// 0  => below threshold
-// 1  => [T, T+step)
-// 2  => [T+step, T+2*step), etc.
-function stepIndexForDiff(diff) {
-  const mag = Math.abs(diff);
-  if (mag < ALERT_DIFF_THRESHOLD_PCT) return 0;
-  return 1 + Math.floor((mag - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT);
-}
-
+/* ===== Helpers for digest & escalation ===== */
 function recentSlope(S) {
+  // Rough d(diff)/dt over the last ~2 samples
   const n = S.buf.length;
   if (n < 2) return 0;
   const a = S.buf[Math.max(0, n - 3)];
@@ -187,77 +190,185 @@ function recentSlope(S) {
   return d / dt; // % per second
 }
 
-function emojiFor(sign, lvl) {
-  const up = '🚀', down = '🧯';
-  const base = sign >= 0 ? up : down;
-  if (lvl >= 5) return base + base + '🔥';
-  if (lvl === 4) return base + base;
-  if (lvl === 3) return base + '🔥';
-  if (lvl === 2) return base;
-  return '⚡';
+// Quantize diff to signed levels (for stepwise alerts): …, -6.25, -5.00, 0, 5.00, 6.25, …
+function quantizeLevel(diffPct) {
+  const ad = Math.abs(diffPct);
+  if (ad < ALERT_DIFF_THRESHOLD_PCT) return 0;
+  const stepsAbove = Math.floor((ad - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1; // 5.00→1, 6.25→2…
+  const level = ALERT_DIFF_THRESHOLD_PCT + (stepsAbove - 1) * ALERT_LEVEL_STEP_PCT;
+  const signed = level * Math.sign(diffPct);
+  return Math.round(signed * 100) / 100; // avoid FP jitter
 }
 
-function maybeAlert(pair, _tsSec) {
+function maybeEscalationAlert(pair) {
   const S = perPair[pair];
   if (!S || !S.last) return;
 
-  const diff = pct(S.diffPct);               // signed
-  const sign = diff >= 0 ? 1 : -1;           // direction of advantage (vol vs price)
-  const step = stepIndexForDiff(diff);       // magnitude bucket
-  const a = (S.alert ||= { lastTime: 0, stepIndex: 0, lastDiff: 0, sign: 0 });
-  const now = nowMs();
+  const diffNow = pct(S.diffPct);
+  const newLevel = quantizeLevel(diffNow);
+  const a = (S.alert ||= { level: 0, lastAt: 0 });
+  const prevLevel = a.level;
+  const now = Date.now();
 
-  const prevStep = a.stepIndex || 0;
-  const deltaSteps = step - prevStep;        // can be negative
-  const crossedOut = (step === 0 && prevStep > 0);
-  const enoughTime = (now - a.lastTime) >= ALERT_MIN_MS;
+  if (newLevel === prevLevel) return;
+  if (now - a.lastAt < ALERT_MIN_MS) return;
 
-  // Decide when to alert:
-  //  - crossed UP one or more step(s)
-  //  - crossed DOWN one or more step(s)
-  //  - dropped back below threshold
-  //  - periodic reminder while still above threshold
-  let reason = '';
-  if (deltaSteps > 0) {
-    const moved = (deltaSteps * ALERT_LEVEL_STEP_PCT);
-    reason = `UP ${moved % 1 ? moved.toFixed(2) : moved.toFixed(0)}%`;
-  } else if (deltaSteps < 0 && step > 0) {
-    const moved = ((-deltaSteps) * ALERT_LEVEL_STEP_PCT);
-    reason = `DOWN ${moved % 1 ? moved.toFixed(2) : moved.toFixed(0)}%`;
-  } else if (crossedOut) {
-    reason = `BACK BELOW ${ALERT_DIFF_THRESHOLD_PCT}%`;
-  } else if (step > 0 && enoughTime) {
-    reason = `REMINDER`;
-  } else {
-    return; // no alert
+  if (newLevel === 0 && prevLevel !== 0) {
+    const emoji = prevLevel > 0 ? '🟢🔕' : '🔴🔕';
+    slack(
+      `${emoji} ${pair}: diff back *below ${ALERT_DIFF_THRESHOLD_PCT.toFixed(2)}%* (now ${pct(diffNow)}%). ` +
+      `VolVel ${pct(S.volVelPct)}%/h • Price ${pct(S.priceChangePct)}%`
+    );
+    a.level = 0;
+    a.lastAt = now;
+    return;
   }
 
-  const slope = recentSlope(S);               // % per second
-  const perMin = pct(slope * 60);
-  const emj = emojiFor(sign, step);
+  const delta = Math.round((newLevel - prevLevel) * 100) / 100;
+  const dir = delta > 0 ? 'UP' : 'DOWN';
+  const arrow = delta > 0 ? '⬆️' : '⬇️';
 
-  const msg = `${emj} *${pair}*  ${reason} — diff=${pct(diff)}%  (volVel=${pct(S.volVelPct)}%/h, priceΔ=${pct(S.priceChangePct)}%) • ${sign >= 0 ? '↑' : '↓'} ~${perMin}%/min`;
+  // Intensity by distance above base (cap at 5)
+  const rank = Math.min(5, Math.floor((Math.abs(newLevel) - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1);
+  const flames = newLevel > 0 ? '🔥'.repeat(rank) : '🧊'.repeat(rank);
 
-  const blocks = [
-    { type: 'section', text: { type: 'mrkdwn', text: msg } },
-    { type: 'context', elements: [
-      { type: 'mrkdwn', text: `Level ${step} (threshold ${ALERT_DIFF_THRESHOLD_PCT}%, step ${ALERT_LEVEL_STEP_PCT}%)` },
-      { type: 'mrkdwn', text: `price=${S.last.price.toFixed(6)} avg24=${S.last.avg24.toFixed(6)} vol24=${Math.round(S.last.vol24)}` }
-    ]}
-  ];
-  slack(msg.replace(/\*/g, ''), blocks);
+  const slope = recentSlope(S);         // % per second
+  const perMin = pct(slope * 60);       // % per minute
 
-  // Update state
-  a.lastTime = now;
-  a.stepIndex = step;
-  a.lastDiff = diff;
-  a.sign = sign;
+  slack(
+    `${flames} ${pair}: ${arrow} ${dir} ${Math.abs(delta).toFixed(2)}% to **${Math.abs(newLevel).toFixed(2)}% diff**\n` +
+    `• VolVel ${pct(S.volVelPct)}%/h • Price ${pct(S.priceChangePct)}% • Diff ${pct(diffNow)}% • ~${perMin}%/min`
+  );
+
+  a.level = newLevel;
+  a.lastAt = now;
 }
 
-// Broadcast snapshots to UI every 2s
+/* ================== DIGEST MODE (anti-spam) ================== */
+function avgFieldSimple(buf, windowSec, field) {
+  if (!buf.length) return null;
+  const cutoff = Math.floor(Date.now()/1000) - windowSec;
+  const recent = buf.filter(x => x.ts >= cutoff);
+  if (!recent.length) return null;
+  let sum = 0;
+  for (const r of recent) sum += Number(r[field] || 0);
+  return sum / recent.length;
+}
+
+function buildDigestReport() {
+  const rows = [];
+  for (const p of WS_PAIRS) {
+    const S = perPair[p];
+    if (!S || !S.last || !S.buf.length) continue;
+
+    const avgDiff = avgFieldSimple(S.buf, DIGEST_WINDOW_SEC, 'diff');
+    if (avgDiff === null) continue;
+    if (Math.abs(avgDiff) < DIGEST_MIN_ABS_DIFF) continue; // ignore weak signals
+
+    const avgVolVel = avgFieldSimple(S.buf, DIGEST_WINDOW_SEC, 'volVel') ?? S.volVelPct;
+    const avgPrice  = avgFieldSimple(S.buf, DIGEST_WINDOW_SEC, 'price')  ?? S.priceChangePct;
+    const slopeMin  = pct(recentSlope(S) * 60);
+
+    rows.push({
+      pair: p,
+      avgDiff: Number(avgDiff.toFixed(2)),
+      avgVolVel: pct(avgVolVel),
+      avgPrice: pct(avgPrice),
+      trendPerMin: slopeMin,
+      lastPrice: S.last.price,
+      ts: S.last.ts
+    });
+  }
+
+  // Winners = positive avgDiff; Losers = negative avgDiff (optional)
+  const winners = rows.filter(r => r.avgDiff >= 0).sort((a,b) => b.avgDiff - a.avgDiff).slice(0, DIGEST_TOP_N);
+  const losers  = DIGEST_INCLUDE_NEGATIVE
+    ? rows.filter(r => r.avgDiff < 0).sort((a,b) => a.avgDiff - b.avgDiff).slice(0, DIGEST_TOP_N)
+    : [];
+
+  return {
+    ts: Math.floor(Date.now()/1000),
+    windowSec: DIGEST_WINDOW_SEC,
+    topWinners: winners,
+    topLosers: losers
+  };
+}
+
+const digestState = { lastTopSymbols: [], lastLeader: null, lastLeaderDiff: null, lastSentAt: 0 };
+
+function rankEmoji(rank) {
+  // rank is 1-based
+  if (rank === 1) return '👑🚀🔥';
+  if (rank === 2) return '🚀🔥';
+  if (rank === 3) return '🚀';
+  if (rank === 4) return '✨';
+  return '•';
+}
+
+function shouldSendDigest(rep) {
+  const winners = rep.topWinners;
+  if (!winners.length) return false;
+
+  const topSymbols = winners.map(w => w.pair).join(',');
+  const leader = winners[0];
+  const changedMembership = topSymbols !== digestState.lastTopSymbols.join(',');
+
+  const diffJump = (digestState.lastLeaderDiff == null)
+    ? true
+    : Math.abs(leader.avgDiff - digestState.lastLeaderDiff) >= DIGEST_CHANGE_STEP_PCT;
+
+  return changedMembership || diffJump;
+}
+
+function postDigest(rep) {
+  const winners = rep.topWinners;
+  const losers = rep.topLosers;
+
+  const header = `🧭 Kraken Volume • ${Math.round(rep.windowSec/60)}m digest • Top ${DIGEST_TOP_N} by sustained Δ (volVel - price)`;
+  const lines = [];
+
+  winners.forEach((w, i) => {
+    const r = i + 1;
+    const em = rankEmoji(r);
+    const trendArrow = w.trendPerMin > 0 ? '↗︎' : (w.trendPerMin < 0 ? '↘︎' : '→');
+    lines.push(`${em} ${r}) *${w.pair}* — avgΔ=${w.avgDiff}%  (volVel=${w.avgVolVel}%/h, price=${w.avgPrice}%, trend ~${w.trendPerMin}%/min ${trendArrow})`);
+  });
+
+  if (losers.length) {
+    lines.push(`\n🔻 Top ${losers.length} negative (sustained):`);
+    losers.forEach((w, i) => {
+      const r = i + 1;
+      const trendArrow = w.trendPerMin > 0 ? '↗︎' : (w.trendPerMin < 0 ? '↘︎' : '→');
+      lines.push(`• ${r}) *${w.pair}* — avgΔ=${w.avgDiff}%  (volVel=${w.avgVolVel}%/h, price=${w.avgPrice}%, trend ~${w.trendPerMin}%/min ${trendArrow})`);
+    });
+  }
+
+  slack(`${header}\n${lines.join('\n')}`);
+
+  // update state
+  digestState.lastTopSymbols = winners.map(w => w.pair);
+  digestState.lastLeader = winners[0].pair;
+  digestState.lastLeaderDiff = winners[0].avgDiff;
+  digestState.lastSentAt = Date.now();
+}
+
+/* Fire digest summaries on a timer */
+if (ALERT_MODE !== 'escalate') {
+  setInterval(() => {
+    try {
+      const rep = buildDigestReport();
+      if (shouldSendDigest(rep)) postDigest(rep);
+    } catch (e) {
+      console.error('digest error', e.message);
+    }
+  }, DIGEST_INTERVAL_SEC * 1000);
+}
+
+/* ================== WS SNAPSHOT PUSH ================== */
+// still stream snapshots to the UI every 2s
 setInterval(() => { io.emit('snapshot', currentSnapshot()); }, 2000);
 
-// ================== KRAKEN WS ==================
+/* ================== KRAKEN WS ================== */
 function krakenSubscribe(ws, pairs) {
   ws.send(JSON.stringify({ event: 'subscribe', pair: pairs, subscription: { name: 'ticker' } }));
 }
@@ -321,7 +432,7 @@ function startKraken(pairsToUse) {
   });
 }
 
-// ================== DISCOVER ALL USD PAIRS (REST) ==================
+/* ================== DISCOVER ALL USD PAIRS (REST) ================== */
 async function discoverAllPairs() {
   try {
     const { data } = await axios.get('https://api.kraken.com/0/public/AssetPairs', { timeout: 20000 });
@@ -348,7 +459,7 @@ async function discoverAllPairs() {
   }
 }
 
-// ================== BOOT ==================
+/* ================== BOOT ================== */
 (async () => {
   if (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL') {
     const discovered = await discoverAllPairs();
@@ -364,7 +475,7 @@ async function discoverAllPairs() {
 
   // Ensure state exists for each subscribed pair
   for (const p of WS_PAIRS) {
-    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { stepIndex: 0, lastTime: 0, lastDiff: 0, sign: 0 } };
+    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
   }
 
   // Start WebSocket
