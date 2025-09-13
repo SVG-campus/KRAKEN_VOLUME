@@ -29,7 +29,8 @@ const io = new Server(server, {
 // Serve the Vite build
 const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
-app.get('*', (_req, res) => {
+// SPA fallback (Express 5 / path-to-regexp v6)
+app.get('/(.*)', (_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
