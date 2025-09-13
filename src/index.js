@@ -1,4 +1,4 @@
-// src/index.js  (CommonJS for easy PM2 usage)
+// src/index.js  (CommonJS for PM2)
 require('dotenv').config();
 const path = require('path');
 const express = require('express');
@@ -14,23 +14,28 @@ const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 const PAPER = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false';
 
 const WS_PAIRS =
-  (process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD')
+  (process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD,SUI/USD')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
 
 // ---------- Express + Socket.IO ----------
 const app = express();
+app.use((req, _res, next) => { console.log(`[HTTP] ${req.method} ${req.url}`); next(); });
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// Serve the Vite build (must be BEFORE the SPA fallback)
+// static frontend (Vite build lives in src/dist)
 const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
 
-// SPA fallback for Express 5 / path-to-regexp v6
-// Use GET only and a normal pattern, and keep this LAST.
-app.get('/*', (_req, res) => {
+// health check
+app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+
+// FINAL SPA FALLBACK (Express 5 safe) — NOTE: no path argument here
+// keep AFTER all API routes and AFTER express.static
+app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
@@ -49,40 +54,25 @@ async function slack(text, blocks) {
 }
 
 // ---------- State & helpers ----------
-/**
- * perPair[pair] = {
- *   last: { ts, vol24, price, avg24 },
- *   buf: [{ts, vol24}, ...],  // recent samples
- *   volVelPct, priceChangePct, diffPct
- * }
- */
 const perPair = Object.create(null);
-for (const p of WS_PAIRS) {
-  perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0 };
-}
-
-function pct(n) { return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
+for (const p of WS_PAIRS) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0 };
+const pct = n => (Number.isFinite(n) ? Math.round(n * 100) / 100 : 0);
 
 function computeVelocity(pair, ts, vol24, price, avg24) {
   const S = perPair[pair];
-  // Keep a small rolling buffer (5–10 minutes is plenty for the UI)
   const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
   S.buf.push({ ts, vol24 });
   while (S.buf.length && ts - S.buf[0].ts > HORIZON_SEC) S.buf.shift();
 
-  // Find the comparison sample ~RATE_WINDOW_SEC ago
   let older = S.buf[0];
   for (let i = S.buf.length - 1; i >= 0; i--) {
     if (ts - S.buf[i].ts >= RATE_WINDOW_SEC) { older = S.buf[i]; break; }
   }
-  const dt = Math.max(1, ts - older.ts); // seconds
+  const dt = Math.max(1, ts - older.ts);
   const v0 = Math.max(older.vol24 || 0, 1e-9);
   const dv = vol24 - (older.vol24 || 0);
 
-  // volume “velocity” as %/h over the chosen window
   const volVelPct = ((dv / v0) * (3600 / dt)) * 100;
-
-  // price change vs 24h average price (WS 'p[1]'), as a % (proxy for “24h price change”)
   const priceChangePct = ((price - avg24) / Math.max(avg24, 1e-9)) * 100;
 
   S.last = { ts, vol24, price, avg24 };
@@ -95,10 +85,8 @@ let lastAlert = 0;
 function maybeAlert(pair) {
   const S = perPair[pair];
   if (!S || !S.last) return;
-
   const now = Date.now();
-  // Cooldown 2 min between alerts to avoid spam
-  if (now - lastAlert < 120000) return;
+  if (now - lastAlert < 120000) return; // 2m cooldown
 
   if (S.volVelPct >= ALERT_THRESHOLD) {
     lastAlert = now;
@@ -111,68 +99,43 @@ function maybeAlert(pair) {
         { type: 'mrkdwn', text: `*Diff (vol - price):*\n${pct(S.diffPct)}%` },
       ] }
     ]);
-  }
-
-  if (S.volVelPct <= -ALERT_THRESHOLD) {
+  } else if (S.volVelPct <= -ALERT_THRESHOLD) {
     lastAlert = now;
-    const msg = `🧯 ${pair}: Negative volume velocity ${pct(S.volVelPct)}%/h (Δ vs price ${pct(S.diffPct)}%).`;
-    slack(msg);
+    slack(`🧯 ${pair}: Negative volume velocity ${pct(S.volVelPct)}%/h (Δ vs price ${pct(S.diffPct)}%).`);
   }
 }
 
-// Snapshot for UI
 function currentSnapshot() {
   const pairs = {};
   for (const p of WS_PAIRS) {
     const S = perPair[p];
     if (!S.last) continue;
     pairs[p] = {
-      ts: S.last.ts,
-      price: S.last.price,
-      avg24: S.last.avg24,
-      vol24: S.last.vol24,
-      volVelPct: pct(S.volVelPct),
-      priceChangePct: pct(S.priceChangePct),
-      diffPct: pct(S.diffPct)
+      ts: S.last.ts, price: S.last.price, avg24: S.last.avg24, vol24: S.last.vol24,
+      volVelPct: pct(S.volVelPct), priceChangePct: pct(S.priceChangePct), diffPct: pct(S.diffPct)
     };
   }
-  // rank by vol velocity
-  const ranked = Object.entries(pairs)
-    .sort((a,b) => b[1].volVelPct - a[1].volVelPct)
-    .map(([k]) => k);
+  const ranked = Object.entries(pairs).sort((a,b) => b[1].volVelPct - a[1].volVelPct).map(([k]) => k);
   return { ts: Math.floor(Date.now()/1000), pairs, top: ranked.slice(0, 2) };
 }
 
-// Broadcast snapshots to UI every 2s
-setInterval(() => {
-  io.emit('snapshot', currentSnapshot());
-}, 2000);
+setInterval(() => io.emit('snapshot', currentSnapshot()), 2000);
 
 // ---------- Kraken WS “ticker” ----------
 function krakenSubscribe(ws, pairs) {
-  ws.send(JSON.stringify({
-    event: 'subscribe',
-    pair: pairs,
-    subscription: { name: 'ticker' }
-  }));
+  ws.send(JSON.stringify({ event: 'subscribe', pair: pairs, subscription: { name: 'ticker' } }));
 }
 
 function parseTickerMessage(msg) {
-  // Ticker comes as an array: [channelId, data, pair, "ticker"]  (sometimes pair and channelName swap)
   if (!Array.isArray(msg) || msg.length < 2 || typeof msg[1] !== 'object') return null;
-
   const data = msg[1];
   const maybe2 = typeof msg[2] === 'string' ? msg[2] : '';
   const maybe3 = typeof msg[3] === 'string' ? msg[3] : '';
-
   const pair = (maybe2.includes('/') ? maybe2 : (maybe3.includes('/') ? maybe3 : null));
   if (!pair) return null;
-
-  // data fields per Kraken docs
-  const lastPrice = parseFloat(data.c?.[0] || '0');     // last trade price
-  const vol24 = parseFloat(data.v?.[1] || '0');         // 24h volume
-  const avg24 = parseFloat(data.p?.[1] || '0');         // 24h average price
-
+  const lastPrice = parseFloat(data.c?.[0] || '0');
+  const vol24 = parseFloat(data.v?.[1] || '0');
+  const avg24 = parseFloat(data.p?.[1] || '0');
   return { pair, lastPrice, vol24, avg24 };
 }
 
@@ -195,7 +158,6 @@ function startKraken() {
       }
       const tick = parseTickerMessage(obj);
       if (!tick) return;
-
       const ts = Math.floor(Date.now() / 1000);
       computeVelocity(tick.pair, ts, tick.vol24, tick.lastPrice, tick.avg24);
       maybeAlert(tick.pair);
@@ -203,16 +165,9 @@ function startKraken() {
       console.error('WS parse err', e.message);
     }
   });
-  ws.on('close', () => {
-    console.warn('Kraken WS closed. Reconnecting in 3s…');
-    setTimeout(startKraken, 3000);
-  });
-  ws.on('error', (e) => {
-    console.error('Kraken WS error', e.message);
-    try { ws.close(); } catch {}
-  });
+  ws.on('close', () => { console.warn('Kraken WS closed. Reconnecting in 3s…'); setTimeout(startKraken, 3000); });
+  ws.on('error', (e) => { console.error('Kraken WS error', e.message); try { ws.close(); } catch {} });
 }
-
 startKraken();
 
 // ---------- Start server ----------
