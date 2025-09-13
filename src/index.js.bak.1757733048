@@ -1,11 +1,20 @@
 const express = require("express");
 // src/index.js  (CommonJS for PM2)
-require('dotenv').config({ quiet: true });
+const express = require("express");
+require('dotenv').config();
+const express = require("express");
 const path = require('path');
+const express = require("express");
+const express = require('express');
+const express = require("express");
 const http = require('http');
+const express = require("express");
 const { Server } = require('socket.io');
+const express = require("express");
 const WebSocket = require('ws');
+const express = require("express");
 const axios = require('axios');
+const express = require("express");
 
 const PORT = Number(process.env.PORT || 3000);
 const RATE_WINDOW_SEC = Number(process.env.RATE_WINDOW_SEC || 60);
@@ -43,6 +52,7 @@ function currentSnapshot() {
 }
 app.get('/api/snapshot', (_req, res) => res.json(currentSnapshot()));
 
+app.use(express.static(path.join(__dirname, "dist")));
 // Final SPA fallback (keep AFTER routes & static)
 app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
@@ -165,6 +175,7 @@ server.listen(PORT, () => {
   console.log(`Open http://<your-ip>:${PORT}/`);
 });
 
+app.use(express.static(path.join(__dirname, "dist")));
 // SPA fallback: serve built index.html for any route not handled above
 app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));

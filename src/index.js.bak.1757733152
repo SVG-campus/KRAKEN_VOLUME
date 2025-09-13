@@ -1,6 +1,6 @@
 const express = require("express");
 // src/index.js  (CommonJS for PM2)
-require('dotenv').config({ quiet: true });
+require('dotenv').config();
 const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
