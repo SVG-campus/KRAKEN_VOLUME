@@ -13,28 +13,37 @@ const ALERT_THRESHOLD = Number(process.env.ALERT_THRESHOLD_PCT || 10);
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 const PAPER = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false';
 
-const WS_PAIRS =
-  (process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD,SUI/USD')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+const WS_PAIRS = (process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 // ---------- Express + Socket.IO ----------
 const app = express();
-app.use((req, _res, next) => { console.log(`[HTTP] ${req.method} ${req.url}`); next(); });
-
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// static frontend (Vite build lives in src/dist)
+// Serve the Vite build from src/dist (because index.js lives in src/)
 const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
 
-// health check
+// --- simple health + debug JSON ---
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+app.get('/api/pairs', (_req, res) => res.json({ pairs: WS_PAIRS }));
+function currentSnapshot() {
+  const pairs = {};
+  for (const p of WS_PAIRS) {
+    const S = perPair[p];
+    if (!S.last) continue;
+    pairs[p] = {
+      ts: S.last.ts, price: S.last.price, avg24: S.last.avg24, vol24: S.last.vol24,
+      volVelPct: pct(S.volVelPct), priceChangePct: pct(S.priceChangePct), diffPct: pct(S.diffPct)
+    };
+  }
+  const ranked = Object.entries(pairs).sort((a,b)=>b[1].volVelPct-a[1].volVelPct).map(([k])=>k);
+  return { ts: Math.floor(Date.now()/1000), pairs, top: ranked.slice(0, 2) };
+}
+app.get('/api/snapshot', (_req, res) => res.json(currentSnapshot()));
 
-// FINAL SPA FALLBACK (Express 5 safe) — NOTE: no path argument here
-// keep AFTER all API routes and AFTER express.static
+// Final SPA fallback (keep AFTER routes & static)
 app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
@@ -56,7 +65,7 @@ async function slack(text, blocks) {
 // ---------- State & helpers ----------
 const perPair = Object.create(null);
 for (const p of WS_PAIRS) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0 };
-const pct = n => (Number.isFinite(n) ? Math.round(n * 100) / 100 : 0);
+function pct(n){ return Number.isFinite(n) ? Math.round(n*100)/100 : 0; }
 
 function computeVelocity(pair, ts, vol24, price, avg24) {
   const S = perPair[pair];
@@ -86,7 +95,7 @@ function maybeAlert(pair) {
   const S = perPair[pair];
   if (!S || !S.last) return;
   const now = Date.now();
-  if (now - lastAlert < 120000) return; // 2m cooldown
+  if (now - lastAlert < 120000) return;
 
   if (S.volVelPct >= ALERT_THRESHOLD) {
     lastAlert = now;
@@ -105,27 +114,13 @@ function maybeAlert(pair) {
   }
 }
 
-function currentSnapshot() {
-  const pairs = {};
-  for (const p of WS_PAIRS) {
-    const S = perPair[p];
-    if (!S.last) continue;
-    pairs[p] = {
-      ts: S.last.ts, price: S.last.price, avg24: S.last.avg24, vol24: S.last.vol24,
-      volVelPct: pct(S.volVelPct), priceChangePct: pct(S.priceChangePct), diffPct: pct(S.diffPct)
-    };
-  }
-  const ranked = Object.entries(pairs).sort((a,b) => b[1].volVelPct - a[1].volVelPct).map(([k]) => k);
-  return { ts: Math.floor(Date.now()/1000), pairs, top: ranked.slice(0, 2) };
-}
-
-setInterval(() => io.emit('snapshot', currentSnapshot()), 2000);
+// Broadcast snapshots to UI every 2s
+setInterval(() => { io.emit('snapshot', currentSnapshot()); }, 2000);
 
 // ---------- Kraken WS “ticker” ----------
 function krakenSubscribe(ws, pairs) {
   ws.send(JSON.stringify({ event: 'subscribe', pair: pairs, subscription: { name: 'ticker' } }));
 }
-
 function parseTickerMessage(msg) {
   if (!Array.isArray(msg) || msg.length < 2 || typeof msg[1] !== 'object') return null;
   const data = msg[1];
@@ -138,7 +133,6 @@ function parseTickerMessage(msg) {
   const avg24 = parseFloat(data.p?.[1] || '0');
   return { pair, lastPrice, vol24, avg24 };
 }
-
 function startKraken() {
   const ws = new WebSocket('wss://ws.kraken.com/');
   ws.on('open', () => {
@@ -150,20 +144,15 @@ function startKraken() {
       const obj = JSON.parse(buf.toString());
       if (obj.event) {
         if (obj.event === 'heartbeat') return;
-        if (obj.event === 'subscriptionStatus') {
-          if (obj.status !== 'subscribed') console.warn('Sub status', obj);
-          return;
-        }
+        if (obj.event === 'subscriptionStatus') { if (obj.status !== 'subscribed') console.warn('Sub status', obj); return; }
         return;
       }
-      const tick = parseTickerMessage(obj);
-      if (!tick) return;
+      const t = parseTickerMessage(obj);
+      if (!t) return;
       const ts = Math.floor(Date.now() / 1000);
-      computeVelocity(tick.pair, ts, tick.vol24, tick.lastPrice, tick.avg24);
-      maybeAlert(tick.pair);
-    } catch (e) {
-      console.error('WS parse err', e.message);
-    }
+      computeVelocity(t.pair, ts, t.vol24, t.lastPrice, t.avg24);
+      maybeAlert(t.pair);
+    } catch (e) { console.error('WS parse err', e.message); }
   });
   ws.on('close', () => { console.warn('Kraken WS closed. Reconnecting in 3s…'); setTimeout(startKraken, 3000); });
   ws.on('error', (e) => { console.error('Kraken WS error', e.message); try { ws.close(); } catch {} });
