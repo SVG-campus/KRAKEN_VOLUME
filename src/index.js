@@ -1,8 +1,7 @@
+const express = require("express");
 // src/index.js  (CommonJS for PM2)
 require('dotenv').config({ quiet: true });
-
 const path = require('path');
-const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const WebSocket = require('ws');
@@ -250,4 +249,9 @@ startKraken();
 server.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
   console.log(`Open http://<your-ip>:${PORT}/`);
+});
+
+// SPA fallback: serve built index.html for any route not handled above
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
