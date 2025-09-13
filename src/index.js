@@ -1,34 +1,37 @@
-const express = require("express");
 // src/index.js  (CommonJS for PM2)
 require('dotenv').config({ quiet: true });
+
 const path = require('path');
+const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const WebSocket = require('ws');
 const axios = require('axios');
 
 // ================== ENV / CONFIG ==================
-const PORT                        = Number(process.env.PORT || 3000);
-const RANK_MODE                   = (process.env.RANK_MODE || 'ratio');   // 'ratio' | 'volvel'
-const RATE_WINDOW_SEC             = Number(process.env.RATE_WINDOW_SEC || 60);
+const PORT                  = Number(process.env.PORT || 3000);
+const RANK_MODE             = (process.env.RANK_MODE || 'ratio');   // 'ratio' | 'volvel'
+const RATE_WINDOW_SEC       = Number(process.env.RATE_WINDOW_SEC || 60);
 
-const ALERT_DIFF_THRESHOLD_PCT    = Number(process.env.ALERT_DIFF_THRESHOLD_PCT || 5);  // default 5%
-const ALERT_LEVEL_STEP_PCT        = Number(process.env.ALERT_LEVEL_STEP_PCT || 5);      // 5% buckets: 5,10,15,20...
-const ALERT_MIN_INTERVAL_SEC      = Number(process.env.ALERT_MIN_INTERVAL_SEC || 300);  // per-coin cool-down
+// Alerting
+const ALERT_DIFF_THRESHOLD_PCT = Number(process.env.ALERT_DIFF_THRESHOLD_PCT || 5);     // base, e.g. 5%
+const ALERT_LEVEL_STEP_PCT     = Number(process.env.ALERT_LEVEL_STEP_PCT || 1.25);      // steps, e.g. 1.25%
+const ALERT_MIN_INTERVAL_SEC   = Number(process.env.ALERT_MIN_INTERVAL_SEC || 300);     // per-coin cool-down
+const ALERT_MIN_MS             = ALERT_MIN_INTERVAL_SEC * 1000;
 
-const SLACK_WEBHOOK_URL           = process.env.SLACK_WEBHOOK_URL || '';
-const PAPER                       = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false';
+const SLACK_WEBHOOK_URL     = process.env.SLACK_WEBHOOK_URL || '';
+const PAPER                 = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false'; // unused but kept
 
-// Pair selection:
-// - If KRAKEN_WS_PAIRS is "ALL", we auto-discover pairs from Kraken REST.
-// - Otherwise, we use the provided comma-list.
-const KRAKEN_WS_PAIRS_RAW         = process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD,SUI/USD';
-const KRAKEN_QUOTE                = process.env.KRAKEN_QUOTE || 'USD';               // used when auto-discovering
-const MAX_SUBSCRIBE_PAIRS         = Number(process.env.MAX_SUBSCRIBE_PAIRS || 300);  // safety limit
-const SUB_BATCH_SIZE              = Number(process.env.SUB_BATCH_SIZE || 25);
-const SUB_BATCH_DELAY_MS          = Number(process.env.SUB_BATCH_DELAY_MS || 600);
-const EXCLUDE_REGEX_STR           = process.env.KRAKEN_EXCLUDE_REGEX || '';          // e.g. '(USDT|EUR)'
-const EXCLUDE_REGEX               = EXCLUDE_REGEX_STR ? new RegExp(EXCLUDE_REGEX_STR) : null;
+// Pair selection
+// - If KRAKEN_WS_PAIRS is "ALL", auto-discover pairs via REST.
+// - Else, use provided comma-list.
+const KRAKEN_WS_PAIRS_RAW   = process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD,SUI/USD';
+const KRAKEN_QUOTE          = process.env.KRAKEN_QUOTE || 'USD';
+const MAX_SUBSCRIBE_PAIRS   = Number(process.env.MAX_SUBSCRIBE_PAIRS || 300);
+const SUB_BATCH_SIZE        = Number(process.env.SUB_BATCH_SIZE || 25);
+const SUB_BATCH_DELAY_MS    = Number(process.env.SUB_BATCH_DELAY_MS || 600);
+const EXCLUDE_REGEX_STR     = process.env.KRAKEN_EXCLUDE_REGEX || ''; // e.g. '(USDT|EUR)'
+const EXCLUDE_REGEX         = EXCLUDE_REGEX_STR ? new RegExp(EXCLUDE_REGEX_STR) : null;
 
 // ================== EXPRESS + SOCKET.IO ==================
 const app = express();
@@ -40,16 +43,20 @@ app.use(express.static(frontendDistPath));
 
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
-let WS_PAIRS = [];        // will be set below (env or discovery)
+let WS_PAIRS = []; // set during boot (env or discovery)
 let discoveredInfo = { total: 0, using: 0, quote: KRAKEN_QUOTE };
 
 app.get('/api/pairs', (_req, res) => {
-  res.json({ mode: (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL' ? 'auto' : 'env'),
-             quote: KRAKEN_QUOTE, totalDiscovered: discoveredInfo.total, subscribed: discoveredInfo.using,
-             pairs: WS_PAIRS });
+  res.json({
+    mode: (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL' ? 'auto' : 'env'),
+    quote: KRAKEN_QUOTE,
+    totalDiscovered: discoveredInfo.total,
+    subscribed: discoveredInfo.using,
+    pairs: WS_PAIRS,
+  });
 });
 
-function pct(n){ return Number.isFinite(n) ? Math.round(n*100)/100 : 0; }
+function pct(n) { return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
 function momentumScore(s) {
   // ratio of velocity to absolute price change; avoid /0
   const denom = Math.max(0.0001, Math.abs(Number(s.priceChangePct || 0)));
@@ -63,18 +70,18 @@ function currentSnapshot() {
   for (const p of WS_PAIRS) {
     const S = perPair[p];
     if (!S || !S.last) continue;
+    const volVelPct = pct(S.volVelPct);
+    const priceChangePct = pct(S.priceChangePct);
+    const diffPct = pct(S.diffPct);
     pairs[p] = {
       ts: S.last.ts,
       price: S.last.price,
       avg24: S.last.avg24,
       vol24: S.last.vol24,
-      volVelPct: pct(S.volVelPct),
-      priceChangePct: pct(S.priceChangePct),
-      diffPct: pct(S.diffPct),
-      ratio: Number((momentumScore({
-        volVelPct: pct(S.volVelPct),
-        priceChangePct: pct(S.priceChangePct)
-      })).toFixed(2))
+      volVelPct,
+      priceChangePct,
+      diffPct,
+      ratio: Number(momentumScore({ volVelPct, priceChangePct }).toFixed(2)),
     };
   }
 
@@ -88,15 +95,16 @@ function currentSnapshot() {
     .map(([k]) => k);
 
   return {
-    ts: Math.floor(Date.now()/1000),
+    ts: Math.floor(Date.now() / 1000),
     meta: { rankMode: RANK_MODE, quote: KRAKEN_QUOTE, subscribed: WS_PAIRS.length },
     pairs,
-    top: ranked.slice(0, 5)
+    top: ranked.slice(0, 5),
   };
 }
 
 app.get('/api/snapshot', (_req, res) => res.json(currentSnapshot()));
 
+// Final SPA fallback (keep AFTER routes & static)
 app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
@@ -116,13 +124,15 @@ async function slack(text, blocks) {
 }
 
 // ================== STATE & COMPUTATION ==================
-for (const p of (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL' ? [] :
-                 KRAKEN_WS_PAIRS_RAW.split(',').map(s => s.trim()).filter(Boolean))) {
-  perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
+// Pre-seed perPair only for explicit env list; auto-discovery will add later.
+if (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() !== 'ALL') {
+  for (const p of KRAKEN_WS_PAIRS_RAW.split(',').map(s => s.trim()).filter(Boolean)) {
+    perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
+  }
 }
 
 function computeVelocity(pair, ts, vol24, price, avg24) {
-  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
+  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
   const S = perPair[pair];
 
   const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
@@ -138,7 +148,9 @@ function computeVelocity(pair, ts, vol24, price, avg24) {
   const v0 = Math.max(older.vol24 || 0, 1e-9);
   const dv = vol24 - (older.vol24 || 0);
 
+  // %/h on 24h volume
   const volVelPct = ((dv / v0) * (3600 / dt)) * 100;
+  // price vs 24h avg
   const priceChangePct = ((price - avg24) / Math.max(avg24, 1e-9)) * 100;
 
   S.last = { ts, vol24, price, avg24 };
@@ -146,20 +158,12 @@ function computeVelocity(pair, ts, vol24, price, avg24) {
   S.priceChangePct = priceChangePct;
   S.diffPct = volVelPct - priceChangePct;
 
-  maybeAlert(pair, ts);
+  maybeAlert(pair);
 }
 
-// ================== ALERTING W/ ESCALATION ==================
-function nowMs() { return Date.now(); }
-
-function levelForDiff(diff) {
-  // 0 if below threshold. Otherwise 1 for >=T, 2 for >=T+step, etc.
-  if (diff < ALERT_DIFF_THRESHOLD_PCT) return 0;
-  return 1 + Math.floor((diff - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT);
-}
-
+// ================== ALERTING (1.25% steps both directions) ==================
 function recentSlope(S) {
-  // estimate d(diff)/dt over the last few samples
+  // Rough d(diff)/dt over the last ~2 samples
   const n = S.buf.length;
   if (n < 2) return 0;
   const a = S.buf[Math.max(0, n - 3)];
@@ -169,47 +173,64 @@ function recentSlope(S) {
   return d / dt; // % per second
 }
 
-function emojiForLevel(lvl) {
-  // escalate the hype 😅
-  if (lvl >= 5) return '🚀🚀🔥🔥';
-  if (lvl === 4) return '🚀🚀🔥';
-  if (lvl === 3) return '🚀🔥';
-  if (lvl === 2) return '🚀';
-  return '⚡';
+// Quantize diff to signed levels: …, -6.25, -5.00, 0, 5.00, 6.25, …
+function quantizeLevel(diffPct) {
+  const ad = Math.abs(diffPct);
+  if (ad < ALERT_DIFF_THRESHOLD_PCT) return 0;
+  const stepsAbove = Math.floor((ad - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1; // 5.00→1, 6.25→2…
+  const level = ALERT_DIFF_THRESHOLD_PCT + (stepsAbove - 1) * ALERT_LEVEL_STEP_PCT;
+  // keep sign of diff
+  const signed = level * Math.sign(diffPct);
+  return Math.round(signed * 100) / 100; // avoid FP jitter
 }
 
-function maybeAlert(pair, tsSec) {
+function maybeAlert(pair) {
   const S = perPair[pair];
   if (!S || !S.last) return;
 
-  const diff = pct(S.diffPct);
-  const lvl = levelForDiff(diff);
-  const a = (S.alert ||= { lastTime: 0, lastLevel: 0, lastDiff: 0 });
-  const now = nowMs();
+  const diffNow = pct(S.diffPct);
+  const newLevel = quantizeLevel(diffNow);
+  const a = (S.alert ||= { level: 0, lastAt: 0 });
+  const prevLevel = a.level;
+  const now = Date.now();
 
-  // Only alert if:
-  //  - level increased, OR
-  //  - enough time has passed and diff is still above threshold (repeat reminder)
-  const enoughTime = (now - a.lastTime) >= ALERT_MIN_INTERVAL_SEC * 1000;
-  if (lvl === 0) return; // below threshold
+  // No change in quantized level → no alert
+  if (newLevel === prevLevel) return;
 
-  if (lvl > a.lastLevel || enoughTime) {
-    const slope = recentSlope(S); // % per second
-    const perMin = pct(slope * 60);
+  // Cooldown
+  if (now - a.lastAt < ALERT_MIN_MS) return;
 
-    const msg = `${emojiForLevel(lvl)} *${pair}*  diff=${pct(diff)}%  (volVel=${pct(S.volVelPct)}%/h, priceΔ=${pct(S.priceChangePct)}%)  • rising ~${perMin}%/min`;
-    const blocks = [
-      { type: 'section', text: { type: 'mrkdwn', text: msg } },
-      { type: 'context', elements: [
-        { type: 'mrkdwn', text: `Level ${lvl} (threshold ${ALERT_DIFF_THRESHOLD_PCT}% step ${ALERT_LEVEL_STEP_PCT}%)` },
-        { type: 'mrkdwn', text: `price=${S.last.price.toFixed(6)} avg24=${S.last.avg24.toFixed(6)} vol24=${Math.round(S.last.vol24)}` }
-      ]}
-    ];
-    slack(msg.replace(/\*/g,''), blocks);
-    a.lastTime = now;
-    a.lastLevel = lvl;
-    a.lastDiff = diff;
+  // Dropped below threshold → disarm once
+  if (newLevel === 0 && prevLevel !== 0) {
+    const emoji = prevLevel > 0 ? '🟢🔕' : '🔴🔕';
+    slack(
+      `${emoji} ${pair}: diff back *below ${ALERT_DIFF_THRESHOLD_PCT.toFixed(2)}%* (now ${pct(diffNow)}%). ` +
+      `VolVel ${pct(S.volVelPct)}%/h • Price ${pct(S.priceChangePct)}%`
+    );
+    a.level = 0;
+    a.lastAt = now;
+    return;
   }
+
+  // Stepped up or down within the band (≥ base)
+  const delta = Math.round((newLevel - prevLevel) * 100) / 100; // signed step change
+  const dir = delta > 0 ? 'UP' : 'DOWN';
+  const arrow = delta > 0 ? '⬆️' : '⬇️';
+
+  // Intensity by distance above base (cap at 5)
+  const rank = Math.min(5, Math.floor((Math.abs(newLevel) - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1);
+  const flames = newLevel > 0 ? '🔥'.repeat(rank) : '🧊'.repeat(rank);
+
+  const slope = recentSlope(S);         // % per second
+  const perMin = pct(slope * 60);       // % per minute (approx trend)
+
+  slack(
+    `${flames} ${pair}: ${arrow} ${dir} ${Math.abs(delta).toFixed(2)}% to **${Math.abs(newLevel).toFixed(2)}% diff**\n` +
+    `• VolVel ${pct(S.volVelPct)}%/h • Price ${pct(S.priceChangePct)}% • Diff ${pct(diffNow)}% • ~${perMin}%/min`
+  );
+
+  a.level = newLevel;
+  a.lastAt = now;
 }
 
 // Broadcast snapshots to UI every 2s
@@ -283,10 +304,12 @@ function startKraken(pairsToUse) {
 async function discoverAllPairs() {
   try {
     const { data } = await axios.get('https://api.kraken.com/0/public/AssetPairs', { timeout: 20000 });
-    if (!data || data.error?.length) throw new Error(data.error?.join(', ') || 'AssetPairs error');
+    if (!data || (data.error && data.error.length)) {
+      throw new Error(data.error?.join(', ') || 'AssetPairs error');
+    }
     const entries = Object.values(data.result || {});
     let pairs = entries
-      .map(x => x.wsname)                       // WebSocket pair name
+      .map(x => x.wsname)
       .filter(Boolean)
       .filter(n => n.endsWith(`/${KRAKEN_QUOTE}`));
 
@@ -311,8 +334,7 @@ async function discoverAllPairs() {
     if (discovered && discovered.length) {
       WS_PAIRS = discovered;
     } else {
-      // Fallback to a sane default if discovery failed
-      WS_PAIRS = ['XBT/USD','ETH/USD','SOL/USD','SUI/USD'];
+      WS_PAIRS = ['XBT/USD', 'ETH/USD', 'SOL/USD', 'SUI/USD'];
       console.warn('Using fallback pairs:', WS_PAIRS.join(', '));
     }
   } else {
@@ -321,13 +343,13 @@ async function discoverAllPairs() {
 
   // Ensure state exists for each subscribed pair
   for (const p of WS_PAIRS) {
-    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
+    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: { level: 0, lastAt: 0 } };
   }
 
   // Start WebSocket
   startKraken(WS_PAIRS);
 
-  // Start server (bind 0.0.0.0 so curl to 127.0.0.1 works too)
+  // Start server (bind 0.0.0.0 so local curl works)
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on :${PORT}`);
     console.log(`Open http://<your-ip>:${PORT}/`);
