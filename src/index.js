@@ -30,7 +30,8 @@ const io = new Server(server, {
 const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
 // SPA fallback (Express 5 / path-to-regexp v6)
-app.get('/(.*)', (_req, res) => {
+// Final SPA fallback (Express 5 safe)
+app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
