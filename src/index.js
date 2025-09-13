@@ -8,52 +8,62 @@ const { Server } = require('socket.io');
 const WebSocket = require('ws');
 const axios = require('axios');
 
-// ---------- ENV ----------
-const PORT = Number(process.env.PORT || 3000);
-const KRAKEN_WS_URL = process.env.KRAKEN_WS_URL || 'wss://ws.kraken.com/';
-const WS_PAIRS = (process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+// ================== ENV / CONFIG ==================
+const PORT                        = Number(process.env.PORT || 3000);
+const RANK_MODE                   = (process.env.RANK_MODE || 'ratio');   // 'ratio' | 'volvel'
+const RATE_WINDOW_SEC             = Number(process.env.RATE_WINDOW_SEC || 60);
 
-const RATE_WINDOW_SEC = Number(process.env.RATE_WINDOW_SEC || 60); // min window to compare volume
-const ALERT_THRESHOLD = Number(process.env.ALERT_THRESHOLD_PCT || 10); // divergence threshold (%)
-const ALERT_MIN_INTERVAL_SEC = Number(process.env.ALERT_MIN_INTERVAL_SEC || 300); // re-notify window
-const RANK_MODE = (process.env.RANK_MODE || 'ratio'); // 'ratio' | 'volvel'
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
-const PAPER = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false'; // not used, but kept
+const ALERT_DIFF_THRESHOLD_PCT    = Number(process.env.ALERT_DIFF_THRESHOLD_PCT || 5);  // default 5%
+const ALERT_LEVEL_STEP_PCT        = Number(process.env.ALERT_LEVEL_STEP_PCT || 5);      // 5% buckets: 5,10,15,20...
+const ALERT_MIN_INTERVAL_SEC      = Number(process.env.ALERT_MIN_INTERVAL_SEC || 300);  // per-coin cool-down
 
-// ---------- Express + Socket.IO ----------
+const SLACK_WEBHOOK_URL           = process.env.SLACK_WEBHOOK_URL || '';
+const PAPER                       = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false';
+
+// Pair selection:
+// - If KRAKEN_WS_PAIRS is "ALL", we auto-discover pairs from Kraken REST.
+// - Otherwise, we use the provided comma-list.
+const KRAKEN_WS_PAIRS_RAW         = process.env.KRAKEN_WS_PAIRS || 'SOL/USD,XBT/USD,ETH/USD,SUI/USD';
+const KRAKEN_QUOTE                = process.env.KRAKEN_QUOTE || 'USD';               // used when auto-discovering
+const MAX_SUBSCRIBE_PAIRS         = Number(process.env.MAX_SUBSCRIBE_PAIRS || 300);  // safety limit
+const SUB_BATCH_SIZE              = Number(process.env.SUB_BATCH_SIZE || 25);
+const SUB_BATCH_DELAY_MS          = Number(process.env.SUB_BATCH_DELAY_MS || 600);
+const EXCLUDE_REGEX_STR           = process.env.KRAKEN_EXCLUDE_REGEX || '';          // e.g. '(USDT|EUR)'
+const EXCLUDE_REGEX               = EXCLUDE_REGEX_STR ? new RegExp(EXCLUDE_REGEX_STR) : null;
+
+// ================== EXPRESS + SOCKET.IO ==================
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// Serve the Vite build from src/dist (because index.js lives in src/)
 const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
 
-// --- simple health + debug JSON ---
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
-app.get('/api/pairs', (_req, res) => res.json({ pairs: WS_PAIRS }));
 
-// ---------- State & helpers ----------
-const perPair = Object.create(null); // { [pair]: { last, buf, volVelPct, priceChangePct, diffPct } }
-for (const p of WS_PAIRS) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0 };
+let WS_PAIRS = [];        // will be set below (env or discovery)
+let discoveredInfo = { total: 0, using: 0, quote: KRAKEN_QUOTE };
 
-function pct(n) { return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
-function roundTo(n, d = 2) { return Number.isFinite(n) ? Number(n.toFixed(d)) : 0; }
+app.get('/api/pairs', (_req, res) => {
+  res.json({ mode: (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL' ? 'auto' : 'env'),
+             quote: KRAKEN_QUOTE, totalDiscovered: discoveredInfo.total, subscribed: discoveredInfo.using,
+             pairs: WS_PAIRS });
+});
 
+function pct(n){ return Number.isFinite(n) ? Math.round(n*100)/100 : 0; }
 function momentumScore(s) {
   // ratio of velocity to absolute price change; avoid /0
   const denom = Math.max(0.0001, Math.abs(Number(s.priceChangePct || 0)));
   return Number(s.volVelPct || 0) / denom;
 }
 
+const perPair = Object.create(null);
+
 function currentSnapshot() {
   const pairs = {};
   for (const p of WS_PAIRS) {
     const S = perPair[p];
-    if (!S.last) continue;
+    if (!S || !S.last) continue;
     pairs[p] = {
       ts: S.last.ts,
       price: S.last.price,
@@ -62,24 +72,32 @@ function currentSnapshot() {
       volVelPct: pct(S.volVelPct),
       priceChangePct: pct(S.priceChangePct),
       diffPct: pct(S.diffPct),
-      ratio: roundTo(momentumScore({ volVelPct: S.volVelPct, priceChangePct: S.priceChangePct }), 2),
+      ratio: Number((momentumScore({
+        volVelPct: pct(S.volVelPct),
+        priceChangePct: pct(S.priceChangePct)
+      })).toFixed(2))
     };
   }
 
   const ranked = Object.entries(pairs)
     .sort((a, b) => {
-      const as = (RANK_MODE === 'ratio') ? momentumScore(a[1]) : a[1].volVelPct;
-      const bs = (RANK_MODE === 'ratio') ? momentumScore(b[1]) : b[1].volVelPct;
+      const av = a[1], bv = b[1];
+      const as = (RANK_MODE === 'ratio') ? momentumScore(av) : av.volVelPct;
+      const bs = (RANK_MODE === 'ratio') ? momentumScore(bv) : bv.volVelPct;
       return bs - as;
     })
     .map(([k]) => k);
 
-  return { ts: Math.floor(Date.now() / 1000), pairs, top: ranked.slice(0, 2) };
+  return {
+    ts: Math.floor(Date.now()/1000),
+    meta: { rankMode: RANK_MODE, quote: KRAKEN_QUOTE, subscribed: WS_PAIRS.length },
+    pairs,
+    top: ranked.slice(0, 5)
+  };
 }
 
 app.get('/api/snapshot', (_req, res) => res.json(currentSnapshot()));
 
-// Final SPA fallback (keep AFTER routes & static)
 app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
@@ -88,12 +106,9 @@ io.on('connection', (socket) => {
   socket.emit('hello', { ok: true, ts: Date.now() });
 });
 
-// ---------- Slack ----------
+// ================== SLACK ==================
 async function slack(text, blocks) {
-  if (!SLACK_WEBHOOK_URL) {
-    console.log('[SLACK]', text);
-    return;
-  }
+  if (!SLACK_WEBHOOK_URL) return;
   try {
     await axios.post(SLACK_WEBHOOK_URL, blocks ? { text, blocks } : { text });
   } catch (e) {
@@ -101,15 +116,20 @@ async function slack(text, blocks) {
   }
 }
 
-// ---------- Velocity calc ----------
-function computeVelocity(pair, ts, vol24, price, avg24) {
-  const S = perPair[pair];
-  const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
+// ================== STATE & COMPUTATION ==================
+for (const p of (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL' ? [] :
+                 KRAKEN_WS_PAIRS_RAW.split(',').map(s => s.trim()).filter(Boolean))) {
+  perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
+}
 
-  S.buf.push({ ts, vol24 });
+function computeVelocity(pair, ts, vol24, price, avg24) {
+  if (!perPair[pair]) perPair[pair] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
+  const S = perPair[pair];
+
+  const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 6, 300);
+  S.buf.push({ ts, vol24, diff: S.diffPct || 0 });
   while (S.buf.length && ts - S.buf[0].ts > HORIZON_SEC) S.buf.shift();
 
-  // find point at least RATE_WINDOW_SEC ago (or oldest)
   let older = S.buf[0];
   for (let i = S.buf.length - 1; i >= 0; i--) {
     if (ts - S.buf[i].ts >= RATE_WINDOW_SEC) { older = S.buf[i]; break; }
@@ -119,74 +139,97 @@ function computeVelocity(pair, ts, vol24, price, avg24) {
   const v0 = Math.max(older.vol24 || 0, 1e-9);
   const dv = vol24 - (older.vol24 || 0);
 
-  // % change in 24h volume per hour
   const volVelPct = ((dv / v0) * (3600 / dt)) * 100;
-  // price vs 24h average
   const priceChangePct = ((price - avg24) / Math.max(avg24, 1e-9)) * 100;
 
   S.last = { ts, vol24, price, avg24 };
   S.volVelPct = volVelPct;
   S.priceChangePct = priceChangePct;
   S.diffPct = volVelPct - priceChangePct;
+
+  maybeAlert(pair, ts);
+}
+
+// ================== ALERTING W/ ESCALATION ==================
+function nowMs() { return Date.now(); }
+
+function levelForDiff(diff) {
+  // 0 if below threshold. Otherwise 1 for >=T, 2 for >=T+step, etc.
+  if (diff < ALERT_DIFF_THRESHOLD_PCT) return 0;
+  return 1 + Math.floor((diff - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT);
+}
+
+function recentSlope(S) {
+  // estimate d(diff)/dt over the last few samples
+  const n = S.buf.length;
+  if (n < 2) return 0;
+  const a = S.buf[Math.max(0, n - 3)];
+  const b = S.buf[n - 1];
+  const d = (b.diff - (a.diff ?? 0));
+  const dt = Math.max(1, b.ts - a.ts);
+  return d / dt; // % per second
+}
+
+function emojiForLevel(lvl) {
+  // escalate the hype 😅
+  if (lvl >= 5) return '🚀🚀🔥🔥';
+  if (lvl === 4) return '🚀🚀🔥';
+  if (lvl === 3) return '🚀🔥';
+  if (lvl === 2) return '🚀';
+  return '⚡';
+}
+
+function maybeAlert(pair, tsSec) {
+  const S = perPair[pair];
+  if (!S || !S.last) return;
+
+  const diff = pct(S.diffPct);
+  const lvl = levelForDiff(diff);
+  const a = (S.alert ||= { lastTime: 0, lastLevel: 0, lastDiff: 0 });
+  const now = nowMs();
+
+  // Only alert if:
+  //  - level increased, OR
+  //  - enough time has passed and diff is still above threshold (repeat reminder)
+  const enoughTime = (now - a.lastTime) >= ALERT_MIN_INTERVAL_SEC * 1000;
+  if (lvl === 0) return; // below threshold
+
+  if (lvl > a.lastLevel || enoughTime) {
+    const slope = recentSlope(S); // % per second
+    const perMin = pct(slope * 60);
+
+    const msg = `${emojiForLevel(lvl)} *${pair}*  diff=${pct(diff)}%  (volVel=${pct(S.volVelPct)}%/h, priceΔ=${pct(S.priceChangePct)}%)  • rising ~${perMin}%/min`;
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: msg } },
+      { type: 'context', elements: [
+        { type: 'mrkdwn', text: `Level ${lvl} (threshold ${ALERT_DIFF_THRESHOLD_PCT}% step ${ALERT_LEVEL_STEP_PCT}%)` },
+        { type: 'mrkdwn', text: `price=${S.last.price.toFixed(6)} avg24=${S.last.avg24.toFixed(6)} vol24=${Math.round(S.last.vol24)}` }
+      ]}
+    ];
+    slack(msg.replace(/\*/g,''), blocks);
+    a.lastTime = now;
+    a.lastLevel = lvl;
+    a.lastDiff = diff;
+  }
 }
 
 // Broadcast snapshots to UI every 2s
 setInterval(() => { io.emit('snapshot', currentSnapshot()); }, 2000);
 
-// ---------- Divergence alerts (vol vs price) ----------
-const alertState = Object.create(null); // { [pair]: { ts, delta } }
-
-function topMode() {
-  return RANK_MODE === 'ratio' ? 'ratio' : 'velocity';
-}
-function formatDeltaGain(g) {
-  if (!Number.isFinite(g) || g <= 0) return '';
-  return `  |  +${g}% since last alert`;
-}
-function pickEmoji(deltaGain) {
-  if (deltaGain >= 3) return '🚀';
-  if (deltaGain >= 1.5) return '📈';
-  return '↗️';
-}
-
-function checkAlerts() {
-  const snap = currentSnapshot();
-  const leader = snap.top?.[0];
-
-  for (const [pair, s] of Object.entries(snap.pairs)) {
-    const vol   = Number(s.volVelPct || 0);
-    const px    = Number(s.priceChangePct || 0);
-    const delta = Number((vol - px).toFixed(2));         // divergence we care about
-    const upTrend = vol > 0 && px > 0;                   // “going up”
-    if (!upTrend || delta < ALERT_THRESHOLD) continue;   // need +10% (or env) while rising
-
-    const prev = alertState[pair] || { ts: 0, delta: 0 };
-    const now = Math.floor(Date.now() / 1000);
-    const deltaGain = Number((delta - prev.delta).toFixed(2));
-    const longEnough     = (now - prev.ts) >= ALERT_MIN_INTERVAL_SEC; // time-based keep-reminding
-    const meaningfulMove = deltaGain >= 1.0;                           // or ≥ +1% more divergence since last
-
-    if (longEnough || meaningfulMove) {
-      const crown  = leader === pair ? ' 👑' : '';
-      const emoji  = pickEmoji(deltaGain);
-      const msg =
-        `🔥⚡ *Divergence Alert*${crown}\n` +
-        `*${pair}*: Δ = *${delta}%* (vel ${vol}%, price ${px}%) ${emoji}` +
-        formatDeltaGain(deltaGain) +
-        `  |  Top by ${topMode()}: ${leader ?? 'n/a'}`;
-
-      slack(msg);
-      alertState[pair] = { ts: now, delta };
-    }
-  }
-}
-
-// run every 30s; will keep reminding while condition persists / grows
-setInterval(checkAlerts, 30 * 1000);
-
-// ---------- Kraken WS “ticker” ----------
+// ================== KRAKEN WS ==================
 function krakenSubscribe(ws, pairs) {
   ws.send(JSON.stringify({ event: 'subscribe', pair: pairs, subscription: { name: 'ticker' } }));
+}
+
+async function subscribeInBatches(ws, pairs) {
+  const chunks = [];
+  for (let i = 0; i < pairs.length; i += SUB_BATCH_SIZE) {
+    chunks.push(pairs.slice(i, i + SUB_BATCH_SIZE));
+  }
+  for (const c of chunks) {
+    krakenSubscribe(ws, c);
+    await new Promise(r => setTimeout(r, SUB_BATCH_DELAY_MS));
+  }
 }
 
 function parseTickerMessage(msg) {
@@ -196,25 +239,22 @@ function parseTickerMessage(msg) {
   const maybe3 = typeof msg[3] === 'string' ? msg[3] : '';
   const pair = (maybe2.includes('/') ? maybe2 : (maybe3.includes('/') ? maybe3 : null));
   if (!pair) return null;
-
   const lastPrice = parseFloat(data.c?.[0] || '0');
   const vol24 = parseFloat(data.v?.[1] || '0');
   const avg24 = parseFloat(data.p?.[1] || '0');
   return { pair, lastPrice, vol24, avg24 };
 }
 
-function startKraken() {
-  const ws = new WebSocket(KRAKEN_WS_URL);
-
-  ws.on('open', () => {
-    console.log('Kraken WS open. Subscribing:', WS_PAIRS.join(', '));
-    krakenSubscribe(ws, WS_PAIRS);
+function startKraken(pairsToUse) {
+  const ws = new WebSocket('wss://ws.kraken.com/');
+  ws.on('open', async () => {
+    console.log('Kraken WS open. Subscribing:', pairsToUse.length, 'pairs');
+    await subscribeInBatches(ws, pairsToUse);
   });
-
   ws.on('message', (buf) => {
     try {
       const obj = JSON.parse(buf.toString());
-      if (obj && obj.event) {
+      if (obj.event) {
         if (obj.event === 'heartbeat') return;
         if (obj.event === 'subscriptionStatus') {
           if (obj.status !== 'subscribed') console.warn('Sub status', obj);
@@ -224,30 +264,73 @@ function startKraken() {
       }
       const t = parseTickerMessage(obj);
       if (!t) return;
-
       const ts = Math.floor(Date.now() / 1000);
       computeVelocity(t.pair, ts, t.vol24, t.lastPrice, t.avg24);
-      // alerts are handled by checkAlerts() timer
     } catch (e) {
       console.error('WS parse err', e.message);
     }
   });
-
   ws.on('close', () => {
     console.warn('Kraken WS closed. Reconnecting in 3s…');
-    setTimeout(startKraken, 3000);
+    setTimeout(() => startKraken(pairsToUse), 3000);
   });
-
   ws.on('error', (e) => {
     console.error('Kraken WS error', e.message);
     try { ws.close(); } catch {}
   });
 }
 
-startKraken();
+// ================== DISCOVER ALL USD PAIRS (REST) ==================
+async function discoverAllPairs() {
+  try {
+    const { data } = await axios.get('https://api.kraken.com/0/public/AssetPairs', { timeout: 20000 });
+    if (!data || data.error?.length) throw new Error(data.error?.join(', ') || 'AssetPairs error');
+    const entries = Object.values(data.result || {});
+    let pairs = entries
+      .map(x => x.wsname)                       // WebSocket pair name
+      .filter(Boolean)
+      .filter(n => n.endsWith(`/${KRAKEN_QUOTE}`));
 
-// ---------- Start server ----------
-server.listen(PORT, () => {
-  console.log(`Server listening on :${PORT}`);
-  console.log(`Open http://<your-ip>:${PORT}/`);
-});
+    if (EXCLUDE_REGEX) pairs = pairs.filter(p => !EXCLUDE_REGEX.test(p));
+
+    // Dedup & cap
+    pairs = Array.from(new Set(pairs));
+    const capped = pairs.slice(0, MAX_SUBSCRIBE_PAIRS);
+
+    discoveredInfo = { total: pairs.length, using: capped.length, quote: KRAKEN_QUOTE };
+    return capped;
+  } catch (e) {
+    console.error('Pair discovery failed:', e.message);
+    return null;
+  }
+}
+
+// ================== BOOT ==================
+(async () => {
+  if (KRAKEN_WS_PAIRS_RAW.trim().toUpperCase() === 'ALL') {
+    const discovered = await discoverAllPairs();
+    if (discovered && discovered.length) {
+      WS_PAIRS = discovered;
+    } else {
+      // Fallback to a sane default if discovery failed
+      WS_PAIRS = ['XBT/USD','ETH/USD','SOL/USD','SUI/USD'];
+      console.warn('Using fallback pairs:', WS_PAIRS.join(', '));
+    }
+  } else {
+    WS_PAIRS = KRAKEN_WS_PAIRS_RAW.split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  // Ensure state exists for each subscribed pair
+  for (const p of WS_PAIRS) {
+    if (!perPair[p]) perPair[p] = { last: null, buf: [], volVelPct: 0, priceChangePct: 0, diffPct: 0, alert: {} };
+  }
+
+  // Start WebSocket
+  startKraken(WS_PAIRS);
+
+  // Start server (bind 0.0.0.0 so curl to 127.0.0.1 works too)
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server listening on :${PORT}`);
+    console.log(`Open http://<your-ip>:${PORT}/`);
+  });
+})();
