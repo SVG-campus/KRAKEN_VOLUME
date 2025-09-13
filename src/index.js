@@ -31,6 +31,7 @@ const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
 // SPA fallback (Express 5 / path-to-regexp v6)
 // Final SPA fallback (Express 5 safe)
+// keep this AFTER your API routes and AFTER express.static
 app.use((_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
