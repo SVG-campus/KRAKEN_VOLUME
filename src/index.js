@@ -22,17 +22,15 @@ const WS_PAIRS =
 // ---------- Express + Socket.IO ----------
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' }
-});
+const io = new Server(server, { cors: { origin: '*' } });
 
-// Serve the Vite build
+// Serve the Vite build (must be BEFORE the SPA fallback)
 const frontendDistPath = path.join(__dirname, 'dist');
 app.use(express.static(frontendDistPath));
-// SPA fallback (Express 5 / path-to-regexp v6)
-// Final SPA fallback (Express 5 safe)
-// keep this AFTER your API routes and AFTER express.static
-app.use((_req, res) => {
+
+// SPA fallback for Express 5 / path-to-regexp v6
+// Use GET only and a normal pattern, and keep this LAST.
+app.get('/*', (_req, res) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
