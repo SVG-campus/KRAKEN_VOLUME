@@ -18,17 +18,23 @@ const LOOKBACK_HOURS            = Number(process.env.LOOKBACK_HOURS || 24);
 const DAYBUF_RES_SEC            = Number(process.env.DAYBUF_RES_SEC || 60); // 1 entry per minute
 const DAYBUF_KEEP_HRS           = Math.max(LOOKBACK_HOURS + 2, 26);        // keep ~26h
 
-// Alerting
+// Alerting (step alerts can be fully disabled)
 const ALERT_DIFF_THRESHOLD_PCT  = Number(process.env.ALERT_DIFF_THRESHOLD_PCT || 5);     // base, e.g. 5%
 const ALERT_LEVEL_STEP_PCT      = Number(process.env.ALERT_LEVEL_STEP_PCT || 1.25);      // steps, e.g. 1.25%
 const ALERT_MIN_INTERVAL_SEC    = Number(process.env.ALERT_MIN_INTERVAL_SEC || 300);     // per-coin cool-down
 const ALERT_MIN_MS              = ALERT_MIN_INTERVAL_SEC * 1000;
+const STEP_ALERTS_ENABLED       = `${process.env.STEP_ALERTS_ENABLED || 'true'}`.toLowerCase() === 'true';
 
-// 5m digest (anti-spam)
+// Digest (anti-spam)
 const DIGEST_EVERY_SEC          = Number(process.env.DIGEST_EVERY_SEC || 300);
-const DIGEST_TOP_N              = Number(process.env.DIGEST_TOP_N || 5);
-const DIGEST_MIN_ABS_DELTA_PCT  = Number(process.env.DIGEST_MIN_ABS_DELTA_PCT || 3); // ignore tiny moves
+const DIGEST_TOP_N              = Number(process.env.DIGEST_TOP_N || 10);
+const DIGEST_MIN_ABS_DELTA_PCT  = Number(process.env.DIGEST_MIN_ABS_DELTA_PCT || 3);     // ignore tiny moves
+const DIGEST_INCLUDE_LOSERS     = `${process.env.DIGEST_INCLUDE_LOSERS || 'true'}`.toLowerCase() === 'true';
+const DIGEST_WINDOW_SEC         = Number(process.env.DIGEST_WINDOW_SEC || 300);          // e.g., 5m sustained avg
+const DIGEST_STREAK_CROWN_MIN   = Number(process.env.DIGEST_STREAK_CROWN_MIN || 2);      // consecutive digests
+const DIGEST_CROWN_WINDOW_SEC   = Number(process.env.DIGEST_CROWN_WINDOW_SEC || 3600);   // hits window for 👑
 
+// Slack/web
 const SLACK_WEBHOOK_URL         = process.env.SLACK_WEBHOOK_URL || '';
 const PAPER                     = `${process.env.PAPER || 'true'}`.toLowerCase() !== 'false'; // not used here
 
@@ -67,12 +73,14 @@ app.get('/api/pairs', (_req, res) => {
 });
 
 function pct(n) { return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
-function nonneg(n, eps = 1e-9){ return Math.max(eps, n || 0); }
+function nonneg(n, eps = 1e-9) { return Math.max(eps, n || 0); }
 
+// Accept either {vol24Pct, price24Pct} OR legacy names {volVelPct, priceChangePct}
 function momentumScore(s) {
-  // Ratio of volume % vs |price %| to prefer large volume shifts against small price changes.
-  const denom = Math.max(0.0001, Math.abs(Number(s.price24Pct || 0)));
-  return Number(s.vol24Pct || 0) / denom;
+  const price = Number(s.price24Pct ?? s.priceChangePct ?? 0);
+  const vol   = Number(s.vol24Pct   ?? s.volVelPct      ?? 0);
+  const denom = Math.max(0.0001, Math.abs(price));
+  return vol / denom;
 }
 
 // ================== STATE ==================
@@ -86,11 +94,11 @@ function momentumScore(s) {
    vol24Pct: 0,
    price24Pct: 0,
    diffPct: 0,
-   // short buffer for slope + digest (~10m)
+   // short buffer for slope + digest (~10m+)
    buf: [{ ts, diff: number }...],
-   // alert & digest state
-   alert: { level: 0, lastAt: 0 },
-   digest: { lastSentAt: 0 }
+   // alerts/digest meta
+   alert: { level: 0, lastAt: 0, hits: 0, hitsWindowStart: 0 },
+   digestStreak: 0
  }
 */
 const perPair = Object.create(null);
@@ -171,8 +179,8 @@ function ensureState(pair) {
       price24Pct: 0,
       diffPct: 0,
       buf: [],
-      alert: { level: 0, lastAt: 0 },
-      digest: { lastSentAt: 0 },
+      alert: { level: 0, lastAt: 0, hits: 0, hitsWindowStart: 0 },
+      digestStreak: 0
     };
   }
   return perPair[pair];
@@ -240,7 +248,7 @@ function computeFromTicker(pair, ts, vol24, price, avg24) {
   S.price24Pct = price24Pct;
   S.diffPct = diffPct;
 
-  // short buffer (~10m) used for trend + digest
+  // short buffer (~10m+) used for trend + digest
   const HORIZON_SEC = Math.max(RATE_WINDOW_SEC * 10, 600);
   S.buf.push({ ts, diff: diffPct });
   while (S.buf.length && ts - S.buf[0].ts > HORIZON_SEC) S.buf.shift();
@@ -263,10 +271,22 @@ function maybeAlert(pair) {
 
   const diffNow = pct(S.diffPct);
   const newLevel = quantizeLevel(diffNow);
-  const a = (S.alert ||= { level: 0, lastAt: 0 });
+  const a = (S.alert ||= { level: 0, lastAt: 0, hits: 0, hitsWindowStart: 0 });
   const prevLevel = a.level;
   const now = Date.now();
 
+  // Count virtual step hits for crown logic
+  if (newLevel !== prevLevel && newLevel !== 0) {
+    if (!a.hitsWindowStart || (now - a.hitsWindowStart) > DIGEST_CROWN_WINDOW_SEC * 1000) {
+      a.hitsWindowStart = now; a.hits = 0;
+    }
+    a.hits++;
+  }
+
+  // If step alerts are disabled, just record state and bail
+  if (!STEP_ALERTS_ENABLED) { a.level = newLevel; a.lastAt = now; return; }
+
+  // (Live alerts path)
   if (newLevel === prevLevel) return;
   if (now - a.lastAt < ALERT_MIN_MS) return;
 
@@ -286,7 +306,6 @@ function maybeAlert(pair) {
   const arrow = delta > 0 ? '⬆️' : '⬇️';
   const rank = Math.min(5, Math.floor((Math.abs(newLevel) - ALERT_DIFF_THRESHOLD_PCT) / ALERT_LEVEL_STEP_PCT) + 1);
   const flames = newLevel > 0 ? '🔥'.repeat(rank) : '🧊'.repeat(rank);
-
   const perMin = pct(recentSlope(S) * 60); // %/min
 
   slack(
@@ -298,51 +317,98 @@ function maybeAlert(pair) {
   a.lastAt = now;
 }
 
-// ================== 5-MIN DIGEST (anti-spam) ==================
-function rankAndDigest() {
-  const now = Math.floor(Date.now() / 1000);
+// ================== DIGEST: winners + losers + crowns ==================
+function avgDeltaOverWindow(S, nowSec, winSec) {
+  if (!S || !S.buf || S.buf.length === 0) return 0;
+  const t0 = nowSec - winSec;
+  let sum = 0, cnt = 0;
+  for (let i = S.buf.length - 1; i >= 0; i--) {
+    const e = S.buf[i]; if (!e) continue;
+    if (e.ts < t0) break;
+    sum += (e.diff ?? 0); cnt++;
+  }
+  return cnt ? (sum / cnt) : 0;
+}
+
+function emojiForRank(i, isLoser = false) {
+  if (isLoser) return ['🧊❄️','🧊','🧊','🥶','🥶','🧊','🧊','🧊','🧊','🧊'][i] || '🧊';
+  return ['👑🚀🔥','🚀🔥','🚀','✨','✨','⭐','⭐','•','•','•'][i] || '•';
+}
+
+function buildLine(i, pair, stats, isLoser) {
+  const mark = emojiForRank(i, isLoser);
+  const crown = stats.crowned ? ' 👑' : '';
+  const arrow = stats.trendPerMin >= 0 ? '↗︎' : '↘︎';
+  return `${mark}${crown} ${i+1}) ${pair} — avgΔ=${pct(stats.avgDelta)}% ` +
+         `(vol24=${pct(stats.vPct)}%, price24=${pct(stats.pPct)}%, trend ~${pct(stats.trendPerMin)}%/min ${arrow})`;
+}
+
+function sendDigest() {
+  const nowSec = Math.floor(Date.now()/1000);
   const rows = [];
 
   for (const pair of WS_PAIRS) {
-    const S = perPair[pair];
-    if (!S || !S.last) continue;
+    const S = perPair[pair]; if (!S || !S.last) continue;
 
-    // average diff over last 5 minutes
-    const cutoff = now - 5 * 60;
-    const window = S.buf.filter(x => x.ts >= cutoff);
-    if (window.length < 2) continue;
+    const vPct = (S.vol24Pct !== undefined) ? S.vol24Pct : 0;
+    const pPct = (S.price24Pct !== undefined) ? S.price24Pct : 0;
+    const avgD = avgDeltaOverWindow(S, nowSec, DIGEST_WINDOW_SEC);
+    if (!Number.isFinite(avgD)) continue;
 
-    const avgDiff = window.reduce((a, b) => a + b.diff, 0) / window.length;
-    if (Math.abs(avgDiff) < DIGEST_MIN_ABS_DELTA_PCT) continue;
+    const slope = recentSlope(S), perMin = slope * 60;
 
-    const slopePerMin = pct(recentSlope(S) * 60);
-    rows.push({
-      pair,
-      avgDiff,
-      vol24Pct: pct(S.vol24Pct),
-      price24Pct: pct(S.price24Pct),
-      trendPerMin: slopePerMin
-    });
+    const crownedByHits =
+      (S.alert?.hits || 0) >= 2 &&
+      (Date.now() - (S.alert?.hitsWindowStart || 0) < DIGEST_CROWN_WINDOW_SEC*1000);
+
+    rows.push([pair, {
+      vPct, pPct,
+      avgDelta: avgD,
+      trendPerMin: perMin,
+      crowned: crownedByHits || (S.digestStreak >= DIGEST_STREAK_CROWN_MIN)
+    }]);
   }
 
-  rows.sort((a, b) => Math.abs(b.avgDiff) - Math.abs(a.avgDiff));
-  const top = rows.slice(0, DIGEST_TOP_N);
-  if (!top.length) return;
+  // Filter out tiny moves
+  const filtered = rows.filter(([_p,s]) => Math.abs(s.avgDelta) >= DIGEST_MIN_ABS_DELTA_PCT);
+  if (!filtered.length) return;
 
-  const title = ':compass: Kraken Volume • 5m digest • Top ' + top.length + ' by sustained Δ (vol24% - price24%)';
-  const medals = ['👑🚀🔥', '🚀🔥', '🚀', '✨', '•'];
-  const lines = top.map((r, i) => {
-    const tag = medals[Math.min(i, medals.length - 1)];
-    const arrow = r.trendPerMin >= 0 ? '↗︎' : '↘︎';
-    return `${tag} ${i+1}) ${r.pair} — avgΔ=${pct(r.avgDiff)}%  (vol24=${r.vol24Pct}%, price24=${r.price24Pct}%, trend ~${r.trendPerMin}%/min ${arrow})`;
-    // intentionally concise: less spammy but informative
-  });
+  // Winners & Losers
+  const winners = filtered
+    .filter(([_p,s]) => s.avgDelta >= 0)
+    .sort((a,b) => b[1].avgDelta - a[1].avgDelta)
+    .slice(0, DIGEST_TOP_N);
 
-  slack([title, ...lines].join('\n'));
+  const losers = DIGEST_INCLUDE_LOSERS ? filtered
+    .filter(([_p,s]) => s.avgDelta < 0)
+    .sort((a,b) => a[1].avgDelta - b[1].avgDelta)
+    .slice(0, DIGEST_TOP_N) : [];
+
+  // Update digest streaks
+  const included = new Set([...winners, ...losers].map(([p]) => p));
+  for (const p of WS_PAIRS) {
+    const S = perPair[p]; if (!S) continue;
+    if (included.has(p)) S.digestStreak = (S.digestStreak || 0) + 1;
+    else S.digestStreak = 0;
+  }
+
+  // Build Slack text
+  const title = `🧭 Kraken Volume • ${Math.round(DIGEST_WINDOW_SEC/60)}m digest • Top ${DIGEST_TOP_N} winners & losers (sustained Δ = vol24% - price24%)`;
+  const lines = [];
+  if (winners.length) {
+    lines.push(`*Winners*`);
+    winners.forEach(([_p,s],i) => lines.push(buildLine(i, _p, s, false)));
+  }
+  if (losers.length) {
+    lines.push(`\n*Losers*`);
+    losers.forEach(([_p,s],i) => lines.push(buildLine(i, _p, s, true)));
+  }
+
+  slack(`${title}\n${lines.join('\n')}`);
 }
 
 // fire digest every DIGEST_EVERY_SEC
-setInterval(rankAndDigest, Math.max(60, DIGEST_EVERY_SEC) * 1000);
+setInterval(sendDigest, Math.max(60, DIGEST_EVERY_SEC) * 1000);
 
 // Broadcast UI snapshots every 2s
 setInterval(() => { io.emit('snapshot', currentSnapshot()); }, 2000);
